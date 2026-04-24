@@ -574,7 +574,7 @@ def _draw_clock(
                 marker=dict(size=9, color="rgba(60,60,60,0.85)", symbol="diamond",
                             line=dict(color="white", width=1)),
                 text=[f" {label}"], textposition="top right",
-                textfont=dict(size=10, color="rgba(220,220,220,0.9)"),
+                textfont=dict(size=10, color="rgba(60,60,60,0.9)"),
                 hovertemplate=f"{label}<br>{d.date()}<extra></extra>",
                 showlegend=False,
             ))

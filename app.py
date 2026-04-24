@@ -112,6 +112,7 @@ def _cached_pipeline(
     n_clusters: int,
     method: str,
     robust: bool,
+    label_mode: str,
     transforms_key: str,
     buckets_key: str,
 ):
@@ -158,7 +159,10 @@ def _cached_pipeline(
     else:
         raise ValueError(f"unknown method: {method}")
 
-    rlabels = label_clusters(themes, res.labels, wf.end_dates, robust=robust)
+    rlabels = label_clusters(
+        themes, res.labels, wf.end_dates,
+        mode=label_mode, robust=robust, individual_z=z,
+    )
     return {
         "panel": panel,
         "z": z,
@@ -347,6 +351,26 @@ if data_choice == "Default (built-in)":
     transforms = DEFAULT_TRANSFORMS
     buckets = DEFAULT_BUCKETS
     panel_source_name = "default"
+    # Drop series from the feature set (but keep in panel/themes) when they
+    # don't extend near the panel's current edge or don't cover enough history
+    # for a reasonable window. `dropna(how="any")` in feature building means
+    # a single stale/short series otherwise collapses the whole matrix.
+    _panel_end = pd.to_datetime(panel.index.max())
+    _stale_cutoff = _panel_end - pd.Timedelta(days=400)
+    _short_cutoff = _panel_end - pd.Timedelta(days=365 * 10)
+    _excluded = []
+    _kept = []
+    for c in feature_codes:
+        s = panel[c].dropna()
+        if s.empty or s.index.max() < _stale_cutoff or s.index.min() > _short_cutoff:
+            _excluded.append(c)
+        else:
+            _kept.append(c)
+    if _excluded:
+        st.sidebar.caption(
+            f"Excluded from features (kept in themes): {', '.join(_excluded)}"
+        )
+    feature_codes = _kept
 else:
     if uploaded is None:
         st.info("Upload a CSV or JSON in the sidebar (first column = date, rest numeric).")
@@ -392,6 +416,7 @@ try:
         n_clusters=n_clusters,
         method=method,
         robust=robust,
+        label_mode=("market" if mode == "Market" else "macro"),
         transforms_key=_encode_pairs({k: v for k, v in transforms.items() if k in all_codes}),
         buckets_key=_encode_pairs({k: v for k, v in buckets.items() if k in all_codes}),
     )
@@ -465,163 +490,238 @@ with tab_data:
     st.subheader("Panel tail")
     st.dataframe(panel[feature_codes].tail(10).round(3), use_container_width=True)
 
-# --- Cycle (Growth × Inflation / Growth × Monetary scatter) ----------------
+# --- Cycle (three clocks) --------------------------------------------------
+
+
+def _clock_df(source: pd.DataFrame, x_col: str, y_col: str) -> pd.DataFrame:
+    return source[[x_col, y_col]].dropna()
+
+
+def _draw_clock(
+    cycle_df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    x_title: str,
+    y_title: str,
+    quad_labels: dict[str, str],
+    quad_colors: dict[str, str],
+    events: list[tuple[str, str]],
+    freq: str,
+    title_note: str,
+):
+    offset_map = {"M": {"1M": 1, "3M": 3, "6M": 6, "12M": 12},
+                  "W": {"1M": 4, "3M": 13, "6M": 26, "12M": 52},
+                  "D": {"1M": 21, "3M": 63, "6M": 126, "12M": 252}}
+    offsets = offset_map.get(freq, offset_map["M"])
+    today_pos = len(cycle_df) - 1
+
+    trail_points = []
+    for label, back in [("T-12M", offsets["12M"]), ("T-6M", offsets["6M"]),
+                        ("T-3M", offsets["3M"]), ("T-1M", offsets["1M"]),
+                        ("Today", 0)]:
+        pos = today_pos - back
+        if pos >= 0:
+            row = cycle_df.iloc[pos]
+            trail_points.append({
+                "label": label,
+                "date": cycle_df.index[pos],
+                "x": float(row[x_col]),
+                "y": float(row[y_col]),
+            })
+    trail = pd.DataFrame(trail_points)
+
+    xr = float(max(1.5, cycle_df[x_col].abs().quantile(0.98) + 0.4))
+    yr = float(max(1.5, cycle_df[y_col].abs().quantile(0.98) + 0.4))
+
+    fig = go.Figure()
+    for quad, (x0, x1, y0, y1) in {
+        "NE": (0, xr, 0, yr), "NW": (-xr, 0, 0, yr),
+        "SE": (0, xr, -yr, 0), "SW": (-xr, 0, -yr, 0),
+    }.items():
+        fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
+                      fillcolor=quad_colors[quad], line=dict(width=0), layer="below")
+        fig.add_annotation(
+            x=(x0 + x1) / 2, y=(y0 + y1) / 2,
+            text=quad_labels[quad], showarrow=False,
+            font=dict(size=11, color="rgba(180,180,180,0.55)"),
+        )
+
+    fig.add_shape(type="line", x0=-xr, x1=xr, y0=0, y1=0,
+                  line=dict(color="rgba(180,180,180,0.5)", width=1, dash="dot"))
+    fig.add_shape(type="line", x0=0, x1=0, y0=-yr, y1=yr,
+                  line=dict(color="rgba(180,180,180,0.5)", width=1, dash="dot"))
+
+    fig.add_trace(go.Scatter(
+        x=cycle_df[x_col], y=cycle_df[y_col],
+        mode="markers",
+        marker=dict(size=4, color="rgba(170,170,170,0.35)"),
+        hovertemplate="%{customdata|%Y-%m-%d}<br>"
+                      f"{x_title}=%{{x:.2f}}  {y_title}=%{{y:.2f}}<extra>history</extra>",
+        customdata=cycle_df.index,
+        name="history",
+    ))
+
+    for date_str, label in events:
+        d = pd.Timestamp(date_str)
+        if d not in cycle_df.index:
+            nearest = cycle_df.index[cycle_df.index.get_indexer([d], method="nearest")[0]]
+            d = nearest
+        if d in cycle_df.index:
+            row = cycle_df.loc[d]
+            fig.add_trace(go.Scatter(
+                x=[row[x_col]], y=[row[y_col]],
+                mode="markers+text",
+                marker=dict(size=9, color="rgba(60,60,60,0.85)", symbol="diamond",
+                            line=dict(color="white", width=1)),
+                text=[f" {label}"], textposition="top right",
+                textfont=dict(size=10, color="rgba(220,220,220,0.9)"),
+                hovertemplate=f"{label}<br>{d.date()}<extra></extra>",
+                showlegend=False,
+            ))
+
+    if not trail.empty:
+        fig.add_trace(go.Scatter(
+            x=trail["x"], y=trail["y"],
+            mode="lines+markers+text",
+            line=dict(color="#FFD700", width=2.5),
+            marker=dict(size=[8, 10, 12, 14, 20],
+                        color=["#FFB800", "#FFC400", "#FFD000", "#FFDC00", "#FFD700"],
+                        symbol=["circle"] * 4 + ["star"],
+                        line=dict(color="#D10000", width=2)),
+            text=trail["label"],
+            textposition="bottom center",
+            textfont=dict(size=11, color="#FFD700"),
+            hovertemplate="%{text}<br>%{customdata|%Y-%m-%d}<br>"
+                          f"{x_title}=%{{x:.2f}}  {y_title}=%{{y:.2f}}<extra></extra>",
+            customdata=trail["date"],
+            name="recent trail",
+        ))
+
+    fig.update_layout(
+        height=620,
+        xaxis=dict(title=x_title, range=[-xr, xr], zeroline=False),
+        yaxis=dict(title=y_title, range=[-yr, yr], zeroline=False),
+        showlegend=False,
+        hovermode="closest",
+    )
+    return fig, trail
+
 
 with tab_cycle:
-    st.subheader("Cycle view — growth / inflation / credit")
-
-    axis_choice = st.radio(
-        "Y axis",
-        ["Inflation", "Monetary / Financial"],
+    clock = st.radio(
+        "Clock view",
+        ["Macro (growth × inflation)",
+         "Market (vol × valuation)",
+         "Sentiment (sentiment × stress)"],
         index=0,
         horizontal=True,
         help=(
-            "Growth-vs-inflation is the classic Merrill Lynch investment clock. "
-            "Swap to the monetary / financial axis for a credit-conditions clock "
-            "(tight spreads + high vol + tight policy = risk-off)."
+            "Three different ways to locate where we are today. "
+            "**Macro** is the classic Merrill Lynch investment clock. "
+            "**Market** plots VIX (vol) against credit spreads (valuation). "
+            "**Sentiment** plots UMich consumer sentiment against an "
+            "aggregate financial-stress axis."
         ),
     )
-    y_col = "inflation" if axis_choice == "Inflation" else "monetary"
 
     themes_all = result["themes"].dropna(how="all")
-    cycle_df = themes_all[["growth", y_col]].dropna()
+    z_all = result["z"]
+
+    if clock.startswith("Macro"):
+        x_col, y_col = "growth", "inflation"
+        source = themes_all
+        x_title, y_title = "Growth z-score", "Inflation z-score"
+        quad_labels = {
+            "NE": "Reflation (high G, high I)",
+            "NW": "Stagflation (low G, high I)",
+            "SE": "Goldilocks (high G, low I)",
+            "SW": "Deflationary bust (low G, low I)",
+        }
+        quad_colors = {"NE": "rgba(255,170,60,0.10)",
+                       "NW": "rgba(220,60,60,0.10)",
+                       "SE": "rgba(60,200,100,0.10)",
+                       "SW": "rgba(60,120,220,0.10)"}
+        note = (
+            "Each dot is one observation on the Merrill Lynch-style clock. "
+            "Upper-right = Reflation; upper-left = Stagflation; lower-right = "
+            "Goldilocks; lower-left = Deflationary bust."
+        )
+    elif clock.startswith("Market"):
+        # Valuation axis: mean of baa & aaa credit spread z (higher = wider = cheaper = stressed).
+        spreads = [c for c in ("baa_spread_z", "aaa_spread_z") if c in z_all.columns]
+        if "vix_z" not in z_all.columns or not spreads:
+            st.info("Need vix_z and credit spread z in the z panel for the market clock.")
+            st.stop()
+        vix_s = z_all["vix_z"]
+        val_s = z_all[spreads].mean(axis=1)
+        source = pd.DataFrame({"vix": vix_s, "valuation": val_s}).dropna()
+        x_col, y_col = "vix", "valuation"
+        x_title, y_title = "VIX z (vol)", "Credit spread z (valuation)"
+        quad_labels = {
+            "NE": "Panic (high vol, cheap credit)",
+            "NW": "Calm but cheap (accumulate)",
+            "SE": "Topping (high vol, rich credit)",
+            "SW": "Melt-up / complacency",
+        }
+        quad_colors = {"NE": "rgba(220,60,60,0.12)",
+                       "NW": "rgba(60,200,100,0.12)",
+                       "SE": "rgba(255,170,60,0.12)",
+                       "SW": "rgba(60,120,220,0.10)"}
+        note = (
+            "X = VIX z (how scared options are); Y = mean credit-spread z "
+            "(how cheap / distressed credit is). Upper-right = Panic; "
+            "lower-left = Melt-up / complacency; lower-right = Topping "
+            "(vol rising before spreads widen); upper-left = calm-but-cheap "
+            "is rare and usually a bargain."
+        )
+    else:  # Sentiment
+        if "umich_sentiment_z" not in z_all.columns:
+            st.info("Need umich_sentiment_z for the sentiment clock.")
+            st.stop()
+        stress_pool = [c for c in ("nfci_z", "vix_z", "baa_spread_z") if c in z_all.columns]
+        if not stress_pool:
+            st.info("Need at least one stress series (nfci / vix / baa_spread) for the sentiment clock.")
+            st.stop()
+        sent_s = z_all["umich_sentiment_z"]
+        # Mean across available stress proxies — higher = more stress.
+        stress_s = z_all[stress_pool].mean(axis=1)
+        source = pd.DataFrame({"sentiment": sent_s, "stress": stress_s}).dropna()
+        x_col, y_col = "sentiment", "stress"
+        x_title, y_title = "Consumer sentiment z", "Financial stress z"
+        quad_labels = {
+            "NE": "Disbelief (bullish + stressed)",
+            "NW": "Fear (bearish + stressed)",
+            "SE": "Euphoria (bullish + calm)",
+            "SW": "Apathy (bearish + calm)",
+        }
+        quad_colors = {"NE": "rgba(255,170,60,0.10)",
+                       "NW": "rgba(220,60,60,0.12)",
+                       "SE": "rgba(60,200,100,0.10)",
+                       "SW": "rgba(150,150,150,0.10)"}
+        note = (
+            "X = UMich consumer sentiment z. Y = composite financial-stress "
+            "z (NFCI / VIX / Baa spread). Upper-right = Disbelief (people "
+            "still bullish but markets nervous — often near a top); "
+            "lower-right = Euphoria (bullish + calm — classic complacency); "
+            "upper-left = Fear; lower-left = Apathy (bearish but calm — "
+            "often near a bottom after capitulation)."
+        )
+
+    cycle_df = _clock_df(source, x_col, y_col)
     if len(cycle_df) < 13:
-        st.info("Not enough theme history for the cycle view.")
+        st.info(f"Not enough history for the {clock.lower()}.")
     else:
-        # Breadcrumb offsets in periods — depend on target frequency
-        offset_map = {"M": {"1M": 1, "3M": 3, "6M": 6, "12M": 12},
-                      "W": {"1M": 4, "3M": 13, "6M": 26, "12M": 52},
-                      "D": {"1M": 21, "3M": 63, "6M": 126, "12M": 252}}
-        offsets = offset_map.get(freq, offset_map["M"])
-        today_pos = len(cycle_df) - 1
-
-        trail_points = []
-        for label, back in [("T-12M", offsets["12M"]), ("T-6M", offsets["6M"]),
-                            ("T-3M", offsets["3M"]), ("T-1M", offsets["1M"]),
-                            ("Today", 0)]:
-            pos = today_pos - back
-            if pos >= 0:
-                row = cycle_df.iloc[pos]
-                trail_points.append({
-                    "label": label,
-                    "date": cycle_df.index[pos],
-                    "growth": float(row["growth"]),
-                    y_col:   float(row[y_col]),
-                })
-        trail = pd.DataFrame(trail_points)
-
-        xr = float(max(1.5, cycle_df["growth"].abs().quantile(0.98) + 0.4))
-        yr = float(max(1.5, cycle_df[y_col].abs().quantile(0.98) + 0.4))
-
-        fig = go.Figure()
-
-        # Quadrant shading
-        if axis_choice == "Inflation":
-            quad_labels = {
-                "NE": "Reflation (high G, high I)",
-                "NW": "Stagflation (low G, high I)",
-                "SE": "Goldilocks (high G, low I)",
-                "SW": "Deflationary bust (low G, low I)",
-            }
-            quad_colors = {"NE": "rgba(255,170,60,0.10)",
-                           "NW": "rgba(220,60,60,0.10)",
-                           "SE": "rgba(60,200,100,0.10)",
-                           "SW": "rgba(60,120,220,0.10)"}
-        else:
-            quad_labels = {
-                "NE": "Expansion, tight credit (late cycle)",
-                "NW": "Slowdown, tight credit (risk-off)",
-                "SE": "Expansion, easy credit (risk-on)",
-                "SW": "Slowdown, easy credit (recovery)",
-            }
-            quad_colors = {"NE": "rgba(220,60,60,0.10)",
-                           "NW": "rgba(150,60,60,0.10)",
-                           "SE": "rgba(60,200,100,0.10)",
-                           "SW": "rgba(60,180,220,0.10)"}
-        for quad, (x0, x1, y0, y1) in {
-            "NE": (0, xr, 0, yr),
-            "NW": (-xr, 0, 0, yr),
-            "SE": (0, xr, -yr, 0),
-            "SW": (-xr, 0, -yr, 0),
-        }.items():
-            fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
-                          fillcolor=quad_colors[quad], line=dict(width=0), layer="below")
-            fig.add_annotation(
-                x=(x0 + x1) / 2, y=(y0 + y1) / 2,
-                text=quad_labels[quad], showarrow=False,
-                font=dict(size=11, color="rgba(180,180,180,0.55)"),
-            )
-
-        # Zero axes
-        fig.add_shape(type="line", x0=-xr, x1=xr, y0=0, y1=0,
-                      line=dict(color="rgba(180,180,180,0.5)", width=1, dash="dot"))
-        fig.add_shape(type="line", x0=0, x1=0, y0=-yr, y1=yr,
-                      line=dict(color="rgba(180,180,180,0.5)", width=1, dash="dot"))
-
-        # Historical dots (light grey)
-        fig.add_trace(go.Scatter(
-            x=cycle_df["growth"], y=cycle_df[y_col],
-            mode="markers",
-            marker=dict(size=4, color="rgba(170,170,170,0.35)"),
-            hovertemplate="%{customdata|%Y-%m-%d}<br>G=%{x:.2f}  "
-                          f"{axis_choice[:1]}=%{{y:.2f}}<extra>history</extra>",
-            customdata=cycle_df.index,
-            name="history",
-        ))
-
-        # Event annotations
-        for date_str, label in CYCLE_EVENTS:
-            d = pd.Timestamp(date_str)
-            if d not in cycle_df.index:
-                # Snap to nearest available row
-                nearest = cycle_df.index[cycle_df.index.get_indexer([d], method="nearest")[0]]
-                d = nearest
-            if d in cycle_df.index:
-                row = cycle_df.loc[d]
-                fig.add_trace(go.Scatter(
-                    x=[row["growth"]], y=[row[y_col]],
-                    mode="markers+text",
-                    marker=dict(size=9, color="rgba(60,60,60,0.85)", symbol="diamond",
-                                line=dict(color="white", width=1)),
-                    text=[f" {label}"], textposition="top right",
-                    textfont=dict(size=10, color="rgba(220,220,220,0.9)"),
-                    hovertemplate=f"{label}<br>{d.date()}<extra></extra>",
-                    showlegend=False,
-                ))
-
-        # Breadcrumb trail
-        if not trail.empty:
-            fig.add_trace(go.Scatter(
-                x=trail["growth"], y=trail[y_col],
-                mode="lines+markers+text",
-                line=dict(color="#FFD700", width=2.5),
-                marker=dict(size=[8, 10, 12, 14, 20],
-                            color=["#FFB800", "#FFC400", "#FFD000", "#FFDC00", "#FFD700"],
-                            symbol=["circle"] * 4 + ["star"],
-                            line=dict(color="#D10000", width=2)),
-                text=trail["label"],
-                textposition="bottom center",
-                textfont=dict(size=11, color="#FFD700"),
-                hovertemplate="%{text}<br>%{customdata|%Y-%m-%d}<br>"
-                              f"G=%{{x:.2f}}  {axis_choice[:1]}=%{{y:.2f}}<extra></extra>",
-                customdata=trail["date"],
-                name="recent trail",
-            ))
-
-        fig.update_layout(
-            height=620,
-            xaxis=dict(title="Growth z-score", range=[-xr, xr], zeroline=False),
-            yaxis=dict(title=f"{axis_choice} z-score", range=[-yr, yr], zeroline=False),
-            showlegend=False,
-            hovermode="closest",
+        fig, trail = _draw_clock(
+            cycle_df, x_col, y_col, x_title, y_title,
+            quad_labels, quad_colors, CYCLE_EVENTS, freq, note,
         )
         st.plotly_chart(fig, use_container_width=True)
 
-        cap = trail.iloc[-1] if not trail.empty else None
-        if cap is not None:
+        if not trail.empty:
+            cap = trail.iloc[-1]
             st.caption(
-                f"**Today ({cap['date'].date()}):** Growth z = {cap['growth']:+.2f}, "
-                f"{axis_choice} z = {cap[y_col]:+.2f}. "
+                f"**Today ({cap['date'].date()}):** {x_title} = {cap['x']:+.2f}, "
+                f"{y_title} = {cap['y']:+.2f}.  {note}  "
                 f"Grey dots = every historical period. Diamonds = landmark events. "
                 f"Gold trail = T-12M → T-6M → T-3M → T-1M → today."
             )
@@ -731,11 +831,17 @@ with tab_ts:
     with st.expander("Cluster summary", expanded=False):
         cluster_df = pd.DataFrame(regime_labels)
         if not cluster_df.empty:
-            cluster_df = cluster_df[["cluster", "label", "n_windows",
-                                     "growth_z", "inflation_z", "financial_z"]]
-            cluster_df[["growth_z", "inflation_z", "financial_z"]] = cluster_df[
-                ["growth_z", "inflation_z", "financial_z"]
-            ].round(2)
+            if mode == "Market":
+                cols = ["cluster", "label", "n_windows",
+                        "financial_z", "sentiment_z", "vix_z",
+                        "growth_z", "inflation_z"]
+            else:
+                cols = ["cluster", "label", "n_windows",
+                        "growth_z", "inflation_z", "financial_z",
+                        "sentiment_z"]
+            cluster_df = cluster_df[cols]
+            num_cols = [c for c in cols if c.endswith("_z")]
+            cluster_df[num_cols] = cluster_df[num_cols].round(2)
             cluster_df = cluster_df.rename(columns={"financial_z": "monetary_z"})
             st.dataframe(cluster_df, use_container_width=True, hide_index=True)
 

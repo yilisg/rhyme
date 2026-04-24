@@ -70,23 +70,43 @@ O(N² · d). Skipped deliberately.
 
 ## Regime labels
 
-For each cluster, Rhyme computes the mean z-score across member windows on
-Growth, Inflation, and Monetary/Financial themes. A label comes from the
-2D grid of (growth sign, inflation sign):
+Rhyme has two mode-specific labelers. The pipeline picks whichever matches
+the selected mode.
 
-|                    | Inflation > +0.3 | Neutral       | Inflation < −0.3 |
-|--------------------|------------------|---------------|------------------|
-| **Growth > +0.3**  | Reflation        | Expansion     | Goldilocks       |
-| **Neutral**        | Inflationary     | Neutral       | Disinflation     |
-| **Growth < −0.3**  | Stagflation      | Slowdown      | Deflationary bust |
+### Macro mode — growth × inflation grid (Merrill Lynch clock)
+
+For each cluster, Rhyme computes the mean z-score across member windows on
+Growth, Inflation, and Monetary/Financial themes. The base label comes
+from the 2D grid of (growth sign, inflation sign):
+
+|                     | Inflation > +0.15 | Neutral       | Inflation < −0.15 |
+|---------------------|-------------------|---------------|-------------------|
+| **Growth > +0.15**  | Reflation         | Expansion     | Goldilocks        |
+| **Neutral**         | Inflationary      | Neutral       | Disinflation      |
+| **Growth < −0.15**  | Stagflation       | Slowdown      | Deflationary bust |
 
 A modifier is appended when the Monetary/Financial z-score exceeds |0.5|:
 
-- `(risk-off)` when the financial theme is in stressed territory (wide spreads, high vol, or tight policy)
-- `(risk-on)` when the financial theme is in easy territory
+- `(risk-off)` when the financial theme is stressed (wide spreads, high vol, tight policy)
+- `(risk-on)` when the financial theme is easy
 
-These are mnemonics, not predictions — they are derived from the cluster
-means alone.
+### Market mode — monetary × sentiment grid
+
+Market mode clusters on monetary + sentiment series, so the label grid
+uses those axes instead:
+
+|                     | Sentiment > +0.25 | Neutral       | Sentiment < −0.25 |
+|---------------------|-------------------|---------------|-------------------|
+| **Monetary < −0.25** (easy) | Melt-up   | Risk-on       | Recovery          |
+| **Neutral**         | Bullish           | Sideways      | Cautious          |
+| **Monetary > +0.25** (tight/stressed) | Tightening peak | Risk-off | Crisis |
+
+A modifier is appended when the VIX z-score exceeds |0.7|:
+
+- `(high vol)` when VIX is elevated
+- `(calm)` when VIX is unusually low (often complacency signal)
+
+These are mnemonics, not predictions — they are derived from cluster means alone.
 
 ## Data harmonization
 
@@ -113,6 +133,90 @@ maximally long history at the cost of over-weighting the 1970s.
 - **Analogs table:** top-K windows ranked by distance, joined with forward
   1m / 3m / 12m returns for SPX, UST 10y yield change, DXY, Baa and Aaa
   credit spreads, gold, and WTI.
+
+## Data sources
+
+### Currently in the default panel (all free)
+
+Growth (from FRED):
+- `ICSA`, `CCSA` — Initial and continuing jobless claims (weekly)
+- `INDPRO` — Industrial production (monthly)
+- `RRSFS` — Real retail & food services sales (monthly)
+- `WEI` — NY Fed Weekly Economic Index (weekly, from 2008)
+- `CFNAI` — Chicago Fed National Activity Index (monthly, from 1967)
+- `GACDISA066MSFRBNY` — NY Fed Empire State manufacturing general business (monthly, from 2001)
+- `GACDFSA066MSFRBPHI` — Philly Fed manufacturing general activity (monthly, from 1968)
+- `HOUST` — Housing starts (monthly)
+- `USSLIND` — US Leading Index (monthly, *discontinued Feb 2020* — retained for historical coverage)
+
+Inflation (from FRED):
+- `CPILFESL`, `PCEPILFE` — Core CPI and Core PCE (monthly)
+- `PCETRIM12M159SFRBDAL` — Dallas Fed trimmed-mean PCE, 12m (monthly)
+- `T5YIFR`, `T10YIE` — 5y5y and 10y breakeven inflation (daily)
+- `DCOILWTICO` — WTI crude oil spot (daily)
+- `EXPINF1YR` — Cleveland Fed 1-year expected inflation nowcast (monthly, from 1982)
+
+Monetary / financial (from FRED + Yahoo):
+- `DFF` — Effective fed funds rate (daily)
+- `T10Y2Y`, `T10Y3M` — Yield curve slopes (daily)
+- `NFCI` — Chicago Fed financial conditions (weekly)
+- `VIXCLS` — VIX implied volatility (daily)
+- `BAA10YM`, `AAA10YM` — Moody's credit spreads vs. 10y (monthly)
+- `BAMLH0A0HYM2` — ICE BofA US High Yield OAS (daily)
+- `DTWEXBGS` — Trade-weighted USD broad (daily)
+- `DGS10` — 10y Treasury yield (daily)
+- `^GSPC` (Yahoo) — S&P 500
+- `GC=F` (Yahoo) — Gold front-month futures
+
+Sentiment (from FRED):
+- `UMCSENT` — University of Michigan consumer sentiment (monthly)
+- `USEPUINDXD` — Baker-Bloom-Davis US Economic Policy Uncertainty (daily, from 1985)
+- `CSCICP03USM665S` — OECD Consumer Confidence Indicator, US (monthly)
+
+### Suggested but not yet included
+
+**ISM Manufacturing / Services PMI** (licensed, paid via ISM or Markit) —
+the canonical US activity surveys. Sub-components like ISM Prices Paid
+are excellent inflation leading indicators. ISM used to publish the
+headline index on FRED but the licensing arrangement ended around 2018,
+so the series no longer updates there. Alternatives in-panel today:
+Chicago Fed NAI (CFNAI), NY Fed Empire State, Philly Fed manufacturing —
+together they approximate the ISM composite reasonably well. To ingest
+ISM directly you would need a paid ISM report subscription or a Markit
+PMI feed (source: S&P Global Market Intelligence).
+
+**Atlanta Fed GDPNow** — real-time nowcast of current-quarter real GDP
+growth. Published at https://www.atlantafed.org/cqer/research/gdpnow as
+CSV. Free but not on FRED, so not yet wired into the default panel. Add
+as a custom series via upload, or plumb through data_fetch.py.
+
+**NY Fed Nowcast** — similar to GDPNow but from the NY Fed:
+https://www.newyorkfed.org/research/policy/nowcast
+
+**Geopolitical Risk (GPR) index** (Caldara & Iacoviello) — monthly and
+daily series at https://www.matteoiacoviello.com/gpr.htm. Free, CSV
+download, updates monthly. A natural complement to EPU for the
+sentiment clock.
+
+**MOVE index** — Treasury implied volatility analogue to VIX. Available
+via ICE / Bloomberg as `^MOVE` on Yahoo Finance, though history is
+inconsistent. Valuable for a rates-stress signal.
+
+**Global PMI composites** — IMF and S&P Global publish these, generally
+behind paywalls. Free proxy: aggregate ECB, BoJ, and PBoC official PMIs.
+
+**Conference Board Leading Economic Index (LEI)** — proprietary, monthly
+release. Historical series available via Conference Board subscription
+or Haver. Similar information to CFNAI + USSLIND — partial substitute.
+
+**Commodity-specific vol & positioning** — COT (Commitment of Traders)
+data from CFTC, weekly, free. Useful for positioning-based sentiment but
+requires some cleaning.
+
+**Corporate earnings revisions & surprise indices** — Citi Economic
+Surprise Indices are the standard, Bloomberg/Citi proprietary. Free
+alternative: Atlanta Fed's inflation expectation surveys, or FRED's
+`MICH` (UMich 1y inflation expectations).
 
 ## References
 

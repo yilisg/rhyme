@@ -30,7 +30,7 @@ from scipy.spatial.distance import mahalanobis
 from sklearn.preprocessing import StandardScaler, normalize
 
 from .forward_returns import DEFAULT_ASSETS, DEFAULT_HORIZONS_WEEKS
-from .similarity import _cov_inv, _sbd
+from .similarity import _cov_inv, _loglik_signature, _sbd
 
 HORIZON_PERIODS_PER_YEAR = {"1m": 12.0, "3m": 4.0, "12m": 1.0}
 HORIZON_PERIODS_BY_FREQ: dict[str, dict[str, int]] = {
@@ -184,10 +184,27 @@ def _distances_past_only(
         rn = ref_s / (np.linalg.norm(ref_s) + 1e-12)
         return 1.0 - Xn @ rn
     if method == "gmm":
-        # GMM clusters use the data but analog distance = Euclidean on the
-        # standardized past-only features. Clustering is irrelevant for analog
-        # ranking — we only need distance-to-reference for the signal.
-        return np.linalg.norm(past_Xs - ref_s, axis=1)
+        # Fit GMM on past-only; distance = Euclidean on per-component weighted
+        # log-likelihood signatures (matches live gmm_similarity).
+        from sklearn.mixture import GaussianMixture
+        n_comp = max(2, min(4, past_Xs.shape[0] // 20))
+        gmm = GaussianMixture(
+            n_components=n_comp, covariance_type="diag",
+            random_state=0, reg_covar=1e-4, n_init=1,
+        )
+        gmm.fit(past_Xs)
+        sig_all = _loglik_signature(gmm, np.vstack([past_Xs, ref_s.reshape(1, -1)]))
+        sig_past = sig_all[:-1]
+        # Clip and standardize using PAST-ONLY stats
+        lo = np.quantile(sig_past, 0.01, axis=0)
+        hi = np.quantile(sig_past, 0.99, axis=0)
+        sig_past_c = np.clip(sig_past, lo, hi)
+        ref_c = np.clip(sig_all[-1], lo, hi)
+        mu = sig_past_c.mean(axis=0)
+        sd = sig_past_c.std(axis=0) + 1e-8
+        sig_past_std = (sig_past_c - mu) / sd
+        ref_std = (ref_c - mu) / sd
+        return np.linalg.norm(sig_past_std - ref_std, axis=1)
     if method == "secondary":
         # SBD over the panel slice (shape-based, window-by-window).
         ref_block = wf_panel_slice.iloc[T_idx : T_idx + window_size].to_numpy(dtype=float)

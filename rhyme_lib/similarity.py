@@ -147,6 +147,13 @@ def cosine_kmeans_similarity(
     )
 
 
+def _loglik_signature(gmm: GaussianMixture, X: np.ndarray) -> np.ndarray:
+    """Per-component weighted log-likelihood for each sample: log[π_k N(x|μ_k,Σ_k)].
+    Shape (n_samples, n_components). Used as a "regime fingerprint" — a window's
+    similarity to another is how close their fingerprints are."""
+    return gmm._estimate_weighted_log_prob(X)
+
+
 def gmm_similarity(
     wf: WindowFeatures,
     n_clusters: int,
@@ -155,15 +162,17 @@ def gmm_similarity(
     min_gap: int | None = None,
     robust: bool = False,
 ) -> SimilarityResult:
-    """Euclidean distance in standardized feature space; soft-probabilistic
-    clustering via a Gaussian Mixture Model. Hard labels are argmax of the
-    posterior — the GMM log-likelihood is still the natural soft membership."""
+    """Soft-probabilistic clustering via a Gaussian Mixture Model. Distance is
+    Euclidean distance between per-component log-likelihood signatures —
+    i.e. each window is represented by its likelihood under each of the k
+    fitted Gaussian regimes, and we compare those signatures. This is
+    genuinely distinct from plain Euclidean / cosine on features: two
+    windows with different raw features can have identical signatures if
+    they are equally likely under the same mix of learned regimes, and
+    vice versa."""
     X = _standardize_features(wf.features)
     ref_idx = len(X) - 1 if reference_idx is None else reference_idx
     gap = wf.window_size if min_gap is None else min_gap
-
-    ref = X[ref_idx]
-    dists = np.linalg.norm(X - ref, axis=1)
 
     cov_type = "diag"  # robust to high-d features; full covariance would overfit
     gmm = GaussianMixture(
@@ -174,6 +183,14 @@ def gmm_similarity(
         n_init=3,
     )
     gmm.fit(X)
+    sig = _loglik_signature(gmm, X)
+    # Clip far-from-any-regime outliers then column-standardize the signature
+    # so the distance is on a unit scale regardless of data dimension.
+    lo = np.quantile(sig, 0.01, axis=0)
+    hi = np.quantile(sig, 0.99, axis=0)
+    sig = np.clip(sig, lo, hi)
+    sig = (sig - sig.mean(axis=0)) / (sig.std(axis=0) + 1e-8)
+    dists = np.linalg.norm(sig - sig[ref_idx], axis=1)
     labels = gmm.predict(X)
 
     return SimilarityResult(

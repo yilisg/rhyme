@@ -440,7 +440,7 @@ with tab_overview:
     display = compact[["rank", "window_start", "end_date", "distance", "label"]].copy()
     display["window_start"] = display["window_start"].dt.strftime("%Y-%m-%d")
     display["end_date"] = display["end_date"].dt.strftime("%Y-%m-%d")
-    display["distance"] = display["distance"].round(3)
+    display["distance"] = display["distance"].apply(lambda v: f"{v:.3f}")
     st.dataframe(display, use_container_width=True, hide_index=True)
 
     st.subheader("Theme z-scores (last 4 observations)")

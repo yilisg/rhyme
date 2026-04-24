@@ -9,7 +9,7 @@ from typing import Literal
 
 import pandas as pd
 
-Bucket = Literal["growth", "inflation", "monetary_financial", "sentiment"]
+Bucket = Literal["growth", "inflation", "monetary", "sentiment"]
 TransformKind = Literal[
     "level",       # stationary: use as-is
     "log_diff",    # log-level with trend: 3m / 12m log-diff
@@ -46,17 +46,17 @@ DEFAULT_SPECS: list[SeriesSpec] = [
     SeriesSpec("be10y",             "T10YIE",     "fred",  "inflation",          "level",       "D", "10y breakeven inflation"),
     SeriesSpec("wti",               "DCOILWTICO", "fred",  "inflation",          "log_diff",    "D", "WTI crude oil spot"),
     # MONETARY / FINANCIAL
-    SeriesSpec("ff",                "DFF",        "fred",  "monetary_financial", "bps_diff",    "D", "Effective fed funds rate"),
-    SeriesSpec("slope_2s10s",       "T10Y2Y",     "fred",  "monetary_financial", "level",       "D", "2s10s Treasury slope"),
-    SeriesSpec("slope_3m10y",       "T10Y3M",     "fred",  "monetary_financial", "level",       "D", "3m10y Treasury slope"),
-    SeriesSpec("nfci",              "NFCI",       "fred",  "monetary_financial", "level",       "W", "Chicago Fed NFCI financial conditions index"),
-    SeriesSpec("vix",               "VIXCLS",     "fred",  "monetary_financial", "level",       "D", "VIX implied volatility"),
-    SeriesSpec("baa_spread",        "BAA10YM",    "fred",  "monetary_financial", "level",       "M", "Moody's Baa minus 10y Treasury (credit risk proxy)"),
-    SeriesSpec("aaa_spread",        "AAA10YM",    "fred",  "monetary_financial", "level",       "M", "Moody's Aaa minus 10y Treasury"),
-    SeriesSpec("dxy",               "DTWEXBGS",   "fred",  "monetary_financial", "log_diff",    "D", "Trade-weighted USD (broad)"),
-    SeriesSpec("spx",               "^GSPC",      "yahoo", "monetary_financial", "log_diff",    "D", "S&P 500 index"),
-    SeriesSpec("ust10_yield",       "DGS10",      "fred",  "monetary_financial", "bps_diff",    "D", "10y Treasury yield"),
-    SeriesSpec("gold",              "GC=F",       "yahoo", "monetary_financial", "log_diff",    "D", "Gold front-month futures (USD/oz)"),
+    SeriesSpec("ff",                "DFF",        "fred",  "monetary", "bps_diff",    "D", "Effective fed funds rate"),
+    SeriesSpec("slope_2s10s",       "T10Y2Y",     "fred",  "monetary", "level",       "D", "2s10s Treasury slope"),
+    SeriesSpec("slope_3m10y",       "T10Y3M",     "fred",  "monetary", "level",       "D", "3m10y Treasury slope"),
+    SeriesSpec("nfci",              "NFCI",       "fred",  "monetary", "level",       "W", "Chicago Fed NFCI financial conditions index"),
+    SeriesSpec("vix",               "VIXCLS",     "fred",  "monetary", "level",       "D", "VIX implied volatility"),
+    SeriesSpec("baa_spread",        "BAA10YM",    "fred",  "monetary", "level",       "M", "Moody's Baa minus 10y Treasury (credit risk proxy)"),
+    SeriesSpec("aaa_spread",        "AAA10YM",    "fred",  "monetary", "level",       "M", "Moody's Aaa minus 10y Treasury"),
+    SeriesSpec("dxy",               "DTWEXBGS",   "fred",  "monetary", "log_diff",    "D", "Trade-weighted USD (broad)"),
+    SeriesSpec("spx",               "^GSPC",      "yahoo", "monetary", "log_diff",    "D", "S&P 500 index"),
+    SeriesSpec("ust10_yield",       "DGS10",      "fred",  "monetary", "bps_diff",    "D", "10y Treasury yield"),
+    SeriesSpec("gold",              "GC=F",       "yahoo", "monetary", "log_diff",    "D", "Gold front-month futures (USD/oz)"),
     # SENTIMENT
     SeriesSpec("umich_sentiment",   "UMCSENT",    "fred",  "sentiment",          "level",       "M", "UMich consumer sentiment"),
 ]

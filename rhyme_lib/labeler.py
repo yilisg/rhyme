@@ -1,7 +1,7 @@
 """Contextual regime labels from cluster mean theme z-scores.
 
 Primary axes: growth, inflation.
-Modifier:    monetary_financial (tight vs. loose / risk-off vs. risk-on).
+Modifier:    monetary (tight vs. loose / risk-off vs. risk-on).
 
 Label grid:
                       inflation > +.3    neutral |infl| <= .3    inflation < -.3
@@ -10,8 +10,8 @@ Label grid:
   growth < -.3    ->  "Stagflation"      "Slowdown"              "Deflationary bust"
 
 Appended modifier:
-  monetary_financial z > +.5  -> " (risk-off)"
-  monetary_financial z < -.5  -> " (risk-on)"
+  monetary z > +.5  -> " (risk-off)"
+  monetary z < -.5  -> " (risk-on)"
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import pandas as pd
 
 GROWTH = "growth"
 INFL = "inflation"
-FIN = "monetary_financial"
+FIN = "monetary"
 
 THRESHOLD = 0.30
 RISK_MOD = 0.50

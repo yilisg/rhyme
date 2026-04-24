@@ -43,6 +43,6 @@ def forward_returns(
         now = col.reindex(ref_dates, method="ffill")
         if kind == "ret":
             out[asset] = np.log(fwd / now)
-        else:  # bps change
-            out[asset] = fwd - now
+        else:  # FRED yields/spreads are in percent; * 100 -> basis points
+            out[asset] = (fwd - now) * 100.0
     return out

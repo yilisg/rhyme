@@ -58,7 +58,7 @@ NBER_RECESSIONS: list[tuple[str, str]] = [
 BUCKET_LABELS = {
     "growth": "Growth",
     "inflation": "Inflation",
-    "monetary_financial": "Monetary / Financial",
+    "monetary": "Monetary / Financial",
     "sentiment": "Sentiment",
 }
 
@@ -83,30 +83,40 @@ def _cached_pipeline(
     rolling_years: int,
     min_years: int,
     window_size: int,
-    selected_codes: tuple[str, ...],
+    feature_codes: tuple[str, ...],
     n_clusters: int,
     method: str,
     transforms_key: str,
     buckets_key: str,
 ):
-    """Key-based cache wrapper so Streamlit only re-runs when inputs change."""
+    """Key-based cache wrapper so Streamlit only re-runs when inputs change.
+
+    z and themes are computed over the FULL panel (so labeler always has
+    growth/inflation/monetary). feature_codes narrows the series fed into
+    the window feature vector — this is how the Macro/Market toggle works.
+    """
     panel = pd.read_parquet(io.BytesIO(panel_bytes))
     panel.index = pd.to_datetime(panel.index)
     transforms = dict(_decode_pairs(transforms_key))
     buckets = dict(_decode_pairs(buckets_key))
-    panel = panel[list(selected_codes)]
 
     z = transform_and_zscore(
         panel, transforms, freq=freq, mode=zmode,
         rolling_years=rolling_years, min_years=min_years,
     )
     themes = theme_aggregate(z, buckets)
-    wf = build_window_features(z, window_size=window_size, n_pca=3)
 
+    z_cols = [f"{c}_z" for c in feature_codes if f"{c}_z" in z.columns]
+    z_for_features = z[z_cols]
+    wf = build_window_features(z_for_features, window_size=window_size, n_pca=3)
+
+    # Allow partial window overlap when history is short (common for macro +
+    # 60-month window where z-valid rows only start ~2018).
+    min_gap = max(window_size // 4, 6)
     if method == "primary":
-        res = primary_similarity(wf, n_clusters=n_clusters, top_k=15, min_gap=window_size)
+        res = primary_similarity(wf, n_clusters=n_clusters, top_k=20, min_gap=min_gap)
     else:
-        res = secondary_similarity(wf, top_k=15, min_gap=window_size)
+        res = secondary_similarity(wf, top_k=20, min_gap=min_gap)
 
     rlabels = label_clusters(themes, res.labels, wf.end_dates)
     return {
@@ -154,25 +164,45 @@ uploaded = None
 if data_choice == "Upload CSV or JSON":
     uploaded = st.sidebar.file_uploader("File (first column = date)", type=["csv", "json"])
 
-bucket_selection = st.sidebar.multiselect(
-    "Buckets to include",
-    list(BUCKET_LABELS.keys()),
-    default=list(BUCKET_LABELS.keys()),
-    format_func=lambda k: BUCKET_LABELS[k],
-    help="Filter which theme buckets feed into the similarity engine. Only applies to the default panel.",
+mode = st.sidebar.radio(
+    "Mode",
+    ["Macro", "Market"],
+    index=0,
+    horizontal=True,
+    help="Macro = growth + inflation series @ monthly, 60-month window. "
+         "Market = monetary + sentiment series @ weekly, 152-week window.",
 )
 
+MODE_BUCKETS = {
+    "Macro": {"growth", "inflation"},
+    "Market": {"monetary", "sentiment"},
+}
+MODE_DEFAULT_FREQ = {"Macro": "M", "Market": "W"}
+MODE_DEFAULT_WINDOW = {"Macro": 60, "Market": 152}
+MODE_WINDOW_RANGE = {"Macro": (12, 120), "Market": (26, 260)}
+
+bucket_selection = MODE_BUCKETS[mode]
+
 with st.sidebar.expander("Frequency & transformation", expanded=False):
-    freq = st.radio("Target frequency", ["W", "M"], index=0, horizontal=True,
-                    help="Weekly for markets; monthly for macro. Default panel ships at daily and is resampled.")
+    freq = st.radio(
+        "Target frequency", ["W", "M"],
+        index=0 if MODE_DEFAULT_FREQ[mode] == "W" else 1,
+        horizontal=True,
+        help="Weekly for markets; monthly for macro. Default panel ships at daily and is resampled.",
+    )
     zmode = st.radio("Z-score window", ["rolling", "expanding"], index=0, horizontal=True)
     rolling_years = st.slider("Rolling years", 5, 40, 20, step=5)
     min_years = st.slider("Minimum history (years)", 2, 15, 10, step=1)
 
 with st.sidebar.expander("Windowing & clustering", expanded=True):
-    window_size = st.slider("Window size (periods)", 4, 104, 26,
-                             help="26 weeks = 6 months. Tune this.")
-    n_clusters = st.slider("Number of regime clusters", 2, 10, 6)
+    wmin, wmax = MODE_WINDOW_RANGE[mode]
+    wdef = MODE_DEFAULT_WINDOW[mode]
+    unit = "months" if freq == "M" else "weeks"
+    window_size = st.slider(
+        f"Window size ({unit})", wmin, wmax, wdef,
+        help=f"{wdef} {unit} is the default for {mode} mode.",
+    )
+    n_clusters = st.slider("Number of regime clusters", 2, 10, 4)
 
 method = st.sidebar.radio(
     "Similarity methodology",
@@ -197,7 +227,7 @@ def _load_upload(file) -> tuple[pd.DataFrame, dict[str, str], dict[str, str]]:
     raw = raw.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
     raw = raw.dropna(how="all")
     transforms = infer_transforms(raw)
-    buckets = {c: "monetary_financial" for c in raw.columns}
+    buckets = {c: "monetary" for c in raw.columns}
     return raw, transforms, buckets
 
 
@@ -210,8 +240,8 @@ if data_choice == "Default (built-in)":
             "to build the cache, then redeploy."
         )
         st.stop()
-    selected_codes_all = [s.code for s in DEFAULT_SPECS if s.bucket in set(bucket_selection)]
-    selected_codes_all = [c for c in selected_codes_all if c in panel.columns]
+    all_codes = [s.code for s in DEFAULT_SPECS if s.code in panel.columns]
+    feature_codes = [c for c in all_codes if DEFAULT_BUCKETS.get(c) in bucket_selection]
     transforms = DEFAULT_TRANSFORMS
     buckets = DEFAULT_BUCKETS
     panel_source_name = "default"
@@ -234,19 +264,17 @@ else:
             for c in panel.columns
         ]
     )
-    selected_codes_all = list(panel.columns)
+    all_codes = list(panel.columns)
+    feature_codes = list(panel.columns)
     panel_source_name = getattr(uploaded, "name", "uploaded")
 
-if not selected_codes_all:
-    st.warning("No series left after bucket filter — select at least one bucket.")
+if not feature_codes:
+    st.warning(f"No series in the {mode} buckets — check your panel bucket tags.")
     st.stop()
 
-# Trim panel to selected buckets before pipeline
-panel_filtered = panel[selected_codes_all].copy()
-
-# Cache-stable serialization of panel
+# Cache-stable serialization of FULL panel (themes need all 4 buckets for labeling)
 _panel_bytes = io.BytesIO()
-panel_filtered.to_parquet(_panel_bytes)
+panel[all_codes].to_parquet(_panel_bytes)
 _panel_bytes.seek(0)
 
 try:
@@ -258,11 +286,11 @@ try:
         rolling_years=rolling_years,
         min_years=min_years,
         window_size=window_size,
-        selected_codes=tuple(selected_codes_all),
+        feature_codes=tuple(feature_codes),
         n_clusters=n_clusters,
         method=method,
-        transforms_key=_encode_pairs({k: v for k, v in transforms.items() if k in selected_codes_all}),
-        buckets_key=_encode_pairs({k: v for k, v in buckets.items() if k in selected_codes_all}),
+        transforms_key=_encode_pairs({k: v for k, v in transforms.items() if k in all_codes}),
+        buckets_key=_encode_pairs({k: v for k, v in buckets.items() if k in all_codes}),
     )
 except ValueError as e:
     st.error(f"Pipeline failed: {e}\n\nTry a shorter window or different frequency.")
@@ -340,9 +368,10 @@ with tab_map:
     st.subheader("Regime map")
     embed_method = st.radio(
         "Embedding",
-        ["umap", "tsne", "pca"],
+        ["pca", "umap", "tsne"],
+        index=0,
         horizontal=True,
-        help="UMAP preserves global structure (preferred). t-SNE looks nicer in 2D but distances between clusters are not meaningful. PCA is linear, deterministic, and inspectable.",
+        help="PCA is linear, deterministic, and inspectable (default). UMAP preserves global structure. t-SNE looks nicer in 2D but distances between clusters are not meaningful.",
     )
     wf_obj = type("WF", (), {})()
     wf_obj.features = result["wf_features"]
@@ -366,7 +395,11 @@ with tab_map:
     fig.add_trace(go.Scatter(
         x=[coords[ref_idx, 0]], y=[coords[ref_idx, 1]],
         mode="markers+text", text=["today"], textposition="top center",
-        marker=dict(size=18, color="black", symbol="star"),
+        marker=dict(
+            size=22, color="#FFD700", symbol="star",
+            line=dict(color="#D10000", width=2),
+        ),
+        textfont=dict(color="#D10000", size=13),
         name="reference",
     ))
     fig.update_layout(height=560, xaxis_title=None, yaxis_title=None)
@@ -386,8 +419,10 @@ with tab_ts:
     themes = result["themes"].dropna(how="all")
     fig = go.Figure()
     for col in themes.columns:
-        if col in bucket_selection or data_choice == "Upload CSV or JSON":
-            fig.add_trace(go.Scatter(x=themes.index, y=themes[col], mode="lines", name=BUCKET_LABELS.get(col, col)))
+        fig.add_trace(go.Scatter(
+            x=themes.index, y=themes[col], mode="lines",
+            name=BUCKET_LABELS.get(col, col), connectgaps=False,
+        ))
 
     end_dates = result["wf_end_dates"]
     labels = result["sim_labels"]
@@ -416,8 +451,13 @@ with tab_ts:
             line_width=0, layer="below",
         )
 
-    fig.update_layout(height=520, hovermode="x unified",
-                      yaxis_title="z-score", xaxis_title=None)
+    x_min = themes.index.min()
+    x_max = themes.index.max()
+    fig.update_layout(
+        height=520, hovermode="x unified",
+        yaxis_title="z-score", xaxis_title=None,
+        xaxis=dict(range=[x_min, x_max]),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
     st.caption(
@@ -432,31 +472,79 @@ with tab_ts:
             cluster_df[["growth_z", "inflation_z", "financial_z"]] = cluster_df[
                 ["growth_z", "inflation_z", "financial_z"]
             ].round(2)
+            cluster_df = cluster_df.rename(columns={"financial_z": "monetary_z"})
             st.dataframe(cluster_df, use_container_width=True, hide_index=True)
 
 # --- Analogs ---------------------------------------------------------------
 
 with tab_analogs:
     st.subheader(f"Top analogs vs. {ref_end.strftime('%Y-%m-%d')}")
-    horizon = st.radio(
-        "Forward horizon (shown in the table)",
-        list(DEFAULT_HORIZONS_WEEKS.keys()), index=1, horizontal=True,
-    )
-    horizon_weeks = DEFAULT_HORIZONS_WEEKS[horizon]
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        horizon = st.radio(
+            "Forward horizon",
+            list(DEFAULT_HORIZONS_WEEKS.keys()), index=1, horizontal=True,
+        )
+    with c2:
+        top_k = st.selectbox("Show top K", [5, 10, 15, 20], index=1)
+
     fwd = fwd_by_horizon[horizon].copy()
     fwd.index = top_analogs["end_date"].values
-    table = top_analogs.copy()
-    table["window_start"] = table["end_date"] - pd.Timedelta(weeks=window_size if freq == "W" else window_size * 4)
-    table = table[["rank", "window_start", "end_date", "distance", "cluster", "label"]]
-    table = pd.concat([table.reset_index(drop=True), fwd.reset_index(drop=True).round(3)], axis=1)
-    table["window_start"] = table["window_start"].dt.strftime("%Y-%m-%d")
-    table["end_date"] = table["end_date"].dt.strftime("%Y-%m-%d")
-    table["distance"] = table["distance"].round(3)
 
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    base = top_analogs.head(top_k).copy()
+    fwd_k = fwd.iloc[:top_k].copy()
+    base["window_start"] = base["end_date"] - pd.Timedelta(
+        weeks=window_size if freq == "W" else window_size * 4
+    )
+    base = base[["rank", "window_start", "end_date", "distance", "cluster", "label"]]
+
+    ret_cols = [a for a, k in DEFAULT_ASSETS.items() if k == "ret" and a in fwd_k.columns]
+    bps_cols = [a for a, k in DEFAULT_ASSETS.items() if k == "bps" and a in fwd_k.columns]
+
+    # Average row — computed on RAW numeric forward returns (before formatting).
+    avg_row = {
+        "rank": "Avg",
+        "window_start": "",
+        "end_date": "",
+        "distance": base["distance"].mean(),
+        "cluster": "",
+        "label": f"Average of top {top_k}",
+    }
+    for c in fwd_k.columns:
+        avg_row[c] = fwd_k[c].mean(skipna=True)
+
+    # Build combined frame (avg first, then the K rows) with numeric forward cols.
+    numeric = pd.concat(
+        [base.reset_index(drop=True), fwd_k.reset_index(drop=True)],
+        axis=1,
+    )
+    numeric = pd.concat([pd.DataFrame([avg_row]), numeric], ignore_index=True)
+
+    # Format for display
+    disp = numeric.copy()
+    disp["window_start"] = disp["window_start"].apply(
+        lambda x: x.strftime("%Y-%m-%d") if isinstance(x, pd.Timestamp) else x
+    )
+    disp["end_date"] = disp["end_date"].apply(
+        lambda x: x.strftime("%Y-%m-%d") if isinstance(x, pd.Timestamp) else x
+    )
+    disp["distance"] = disp["distance"].apply(
+        lambda v: f"{v:.3f}" if pd.notna(v) else ""
+    )
+    for c in ret_cols:
+        disp[c] = numeric[c].apply(
+            lambda v: f"{v * 100:.2f}%" if pd.notna(v) else ""
+        )
+    for c in bps_cols:
+        disp[c] = numeric[c].apply(
+            lambda v: f"{int(round(v))} bps" if pd.notna(v) else ""
+        )
+
+    st.dataframe(disp, use_container_width=True, hide_index=True)
     st.caption(
-        "`spx`, `dxy`, `gold`, `wti` = forward log returns; "
-        "`ust10_yield`, `baa_spread`, `aaa_spread` = forward changes (pct points)."
+        "`spx`, `dxy`, `gold`, `wti` = forward log returns (shown as %). "
+        "`ust10_yield`, `baa_spread`, `aaa_spread` = forward changes in basis points. "
+        "The **Avg** row averages the top K forward outcomes."
     )
 
     st.subheader("Series overlay: reference window vs. top analogs")
@@ -468,7 +556,10 @@ with tab_analogs:
         zpanel.index.get_loc(ref_end) - window_size + 1 : zpanel.index.get_loc(ref_end) + 1
     ].reset_index(drop=True)
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(y=ref_block.values, name="reference", line=dict(width=3, color="black")))
+    fig2.add_trace(go.Scatter(
+        y=ref_block.values, name="reference (today)",
+        line=dict(width=4, color="#FFD700"),
+    ))
     for _, row in top_analogs.head(5).iterrows():
         end = row["end_date"]
         if end not in zpanel.index:

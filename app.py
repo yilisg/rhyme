@@ -350,7 +350,7 @@ with tab_data:
     st.write(
         f"{panel.shape[0]:,} rows × {panel.shape[1]} series  "
         f"|  {panel.index.min().date()} → {panel.index.max().date()}  "
-        f"|  selected: {len(selected_codes_all)} series"
+        f"|  {mode} mode feeds {len(feature_codes)} series into the similarity engine"
     )
     show_meta = meta.copy()
     if "start" in show_meta.columns and show_meta["start"].notna().any():
@@ -360,7 +360,7 @@ with tab_data:
     st.dataframe(show_meta, use_container_width=True, hide_index=True)
 
     st.subheader("Panel tail")
-    st.dataframe(panel_filtered.tail(10).round(3), use_container_width=True)
+    st.dataframe(panel[feature_codes].tail(10).round(3), use_container_width=True)
 
 # --- Regime map (2D embedding) ---------------------------------------------
 

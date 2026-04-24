@@ -28,11 +28,18 @@ class WindowFeatures:
     window_size: int
 
 
-def _moments(block: np.ndarray) -> np.ndarray:
-    """block: (T, d) z-scored values for one window. Returns (5d,)."""
+def _moments(block: np.ndarray, robust: bool = False) -> np.ndarray:
+    """block: (T, d) z-scored values for one window. Returns (5d,).
+
+    If `robust`, uses median and MAD (×1.4826) instead of mean and std."""
     T, d = block.shape
-    means = block.mean(axis=0)
-    stds = block.std(axis=0)
+    if robust:
+        means = np.median(block, axis=0)
+        mad = np.median(np.abs(block - means), axis=0) * 1.4826
+        stds = np.where(mad > 0, mad, np.std(block, axis=0))
+    else:
+        means = block.mean(axis=0)
+        stds = block.std(axis=0)
     skews = np.array([_safe_skew(block[:, j]) for j in range(d)])
     ac1 = np.array([_safe_ac1(block[:, j]) for j in range(d)])
     drift = block[-1] - block[0]
@@ -63,11 +70,17 @@ def _safe_ac1(x: np.ndarray) -> float:
     return float(((a - a.mean()) * (b - b.mean())).mean() / (sa * sb))
 
 
-def _corr_upper(block: np.ndarray) -> np.ndarray:
+def _corr_upper(block: np.ndarray, robust: bool = False) -> np.ndarray:
     d = block.shape[1]
     if d < 2:
         return np.array([])
-    c = np.corrcoef(block.T)
+    if robust:
+        # Spearman rank correlation via Pearson on ranks — robust to outliers.
+        ranks = np.argsort(np.argsort(block, axis=0), axis=0).astype(float)
+        c = np.corrcoef(ranks.T)
+    else:
+        c = np.corrcoef(block.T)
+    c = np.nan_to_num(c, nan=0.0)
     iu = np.triu_indices(d, k=1)
     return c[iu]
 
@@ -76,6 +89,7 @@ def build_window_features(
     zpanel: pd.DataFrame,
     window_size: int,
     n_pca: int = 3,
+    robust: bool = False,
 ) -> WindowFeatures:
     clean = zpanel.dropna(how="any").sort_index()
     if len(clean) < window_size + 10:
@@ -106,8 +120,8 @@ def build_window_features(
     feat_list = []
     for i in range(n_windows):
         block = values[i : i + window_size]
-        m = _moments(block)
-        c = _corr_upper(block)
+        m = _moments(block, robust=robust)
+        c = _corr_upper(block, robust=robust)
         pca = PCA(n_components=min(n_pca, d, window_size - 1))
         scores = pca.fit_transform(block)[-1]
         if len(scores) < n_pca:

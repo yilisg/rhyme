@@ -77,24 +77,53 @@ def _lookback_periods(freq: TargetFreq) -> tuple[int, int]:
     return 63, 252  # D (business days)
 
 
+MAD_TO_STD = 1.4826  # scale factor to make MAD comparable to std for Gaussian data
+
+
+def _mad(x: pd.Series) -> float:
+    """Median absolute deviation, scaled to match std on Gaussian data."""
+    med = x.median()
+    return MAD_TO_STD * (x - med).abs().median()
+
+
 def _z_score(
     df: pd.DataFrame,
     freq: TargetFreq,
     mode: ZMode = "rolling",
     rolling_years: int = DEFAULT_ROLLING_YEARS,
     min_years: int = DEFAULT_MIN_YEARS,
+    robust: bool = False,
 ) -> pd.DataFrame:
     periods_per_year = {"D": 252, "W": 52, "M": 12}[freq]
     window = rolling_years * periods_per_year
     min_periods = min_years * periods_per_year
 
     if mode == "rolling":
-        mean = df.rolling(window, min_periods=min_periods).mean()
-        std = df.rolling(window, min_periods=min_periods).std()
+        roller = df.rolling(window, min_periods=min_periods)
     else:
-        mean = df.expanding(min_periods=min_periods).mean()
-        std = df.expanding(min_periods=min_periods).std()
-    return ((df - mean) / std.replace(0, np.nan)).rename(columns=lambda c: f"{c}_z")
+        roller = df.expanding(min_periods=min_periods)
+
+    if robust:
+        center = roller.median()
+        scale = roller.apply(_mad_np, raw=True)
+    else:
+        center = roller.mean()
+        scale = roller.std()
+
+    out = ((df - center) / scale.replace(0, np.nan)).rename(columns=lambda c: f"{c}_z")
+    if robust:
+        # Winsorize extreme robust z values so a single shock doesn't dominate feature moments
+        out = out.clip(lower=-5.0, upper=5.0)
+    return out
+
+
+def _mad_np(x: np.ndarray) -> float:
+    """Fast MAD for rolling.apply (numeric-only, pre-scaled to match std)."""
+    x = x[~np.isnan(x)]
+    if len(x) == 0:
+        return np.nan
+    med = np.median(x)
+    return float(MAD_TO_STD * np.median(np.abs(x - med)))
 
 
 def transform_and_zscore(
@@ -104,6 +133,7 @@ def transform_and_zscore(
     mode: ZMode = "rolling",
     rolling_years: int = DEFAULT_ROLLING_YEARS,
     min_years: int = DEFAULT_MIN_YEARS,
+    robust: bool = False,
 ) -> pd.DataFrame:
     resampled = resample_panel(panel, freq)
 
@@ -113,15 +143,23 @@ def transform_and_zscore(
         cols.append(_stationarize_col(resampled[col], t, freq))
     stationarized = pd.concat(cols, axis=1)
 
-    return _z_score(stationarized, freq, mode, rolling_years, min_years)
+    if robust:
+        # Per-column winsorization at 1%/99% quantiles before z-scoring to cap outliers.
+        lo = stationarized.quantile(0.01)
+        hi = stationarized.quantile(0.99)
+        stationarized = stationarized.clip(lower=lo, upper=hi, axis=1)
+
+    return _z_score(stationarized, freq, mode, rolling_years, min_years, robust=robust)
 
 
 def theme_aggregate(
     zdf: pd.DataFrame,
     bucket_map: Mapping[str, str],
+    robust: bool = False,
 ) -> pd.DataFrame:
     """Equal-weight average of z-scored columns within each bucket. Expects
-    columns in zdf named "<code>_z"; bucket_map is {code: bucket}."""
+    columns in zdf named "<code>_z"; bucket_map is {code: bucket}.
+    If `robust`, uses median instead of mean."""
     buckets: dict[str, list[str]] = {}
     for zcol in zdf.columns:
         code = zcol[:-2] if zcol.endswith("_z") else zcol
@@ -129,8 +167,9 @@ def theme_aggregate(
         if b is None:
             continue
         buckets.setdefault(b, []).append(zcol)
+    reducer = "median" if robust else "mean"
     return pd.DataFrame(
-        {b: zdf[cols].mean(axis=1) for b, cols in buckets.items()},
+        {b: getattr(zdf[cols], reducer)(axis=1) for b, cols in buckets.items()},
         index=zdf.index,
     )
 

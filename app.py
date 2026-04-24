@@ -23,6 +23,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from rhyme_lib.backtest import backtest_stats, format_backtest
 from rhyme_lib.features import build_window_features
 from rhyme_lib.forward_returns import DEFAULT_ASSETS, DEFAULT_HORIZONS_WEEKS, forward_returns
 from rhyme_lib.labeler import label_clusters, label_map
@@ -32,7 +33,13 @@ from rhyme_lib.panel import (
     DEFAULT_TRANSFORMS,
     load_default_panel,
 )
-from rhyme_lib.similarity import embed_2d, primary_similarity, secondary_similarity
+from rhyme_lib.similarity import (
+    cosine_kmeans_similarity,
+    embed_2d,
+    gmm_similarity,
+    primary_similarity,
+    secondary_similarity,
+)
 from rhyme_lib.transforms import (
     infer_transforms,
     resample_panel,
@@ -53,6 +60,19 @@ NBER_RECESSIONS: list[tuple[str, str]] = [
     ("2001-03-01", "2001-11-30"),
     ("2007-12-01", "2009-06-30"),
     ("2020-02-01", "2020-04-30"),
+]
+
+# Big-ticket macro / market events — annotated on the Cycle scatter so the
+# chart reads as history, not just a blob of dots.
+CYCLE_EVENTS: list[tuple[str, str]] = [
+    ("1973-11-30", "OPEC oil shock"),
+    ("1980-03-31", "Volcker peak"),
+    ("1987-10-31", "Black Monday"),
+    ("2000-03-31", "Dot-com peak"),
+    ("2008-09-30", "Lehman / GFC"),
+    ("2011-08-31", "US debt downgrade"),
+    ("2020-03-31", "COVID trough"),
+    ("2022-06-30", "2022 inflation peak"),
 ]
 
 BUCKET_LABELS = {
@@ -86,6 +106,7 @@ def _cached_pipeline(
     feature_codes: tuple[str, ...],
     n_clusters: int,
     method: str,
+    robust: bool,
     transforms_key: str,
     buckets_key: str,
 ):
@@ -94,6 +115,8 @@ def _cached_pipeline(
     z and themes are computed over the FULL panel (so labeler always has
     growth/inflation/monetary). feature_codes narrows the series fed into
     the window feature vector — this is how the Macro/Market toggle works.
+    `robust=True` swaps mean→median / std→MAD / Pearson→Spearman and uses
+    MinCovDet in the Mahalanobis method.
     """
     panel = pd.read_parquet(io.BytesIO(panel_bytes))
     panel.index = pd.to_datetime(panel.index)
@@ -102,23 +125,35 @@ def _cached_pipeline(
 
     z = transform_and_zscore(
         panel, transforms, freq=freq, mode=zmode,
-        rolling_years=rolling_years, min_years=min_years,
+        rolling_years=rolling_years, min_years=min_years, robust=robust,
     )
-    themes = theme_aggregate(z, buckets)
+    themes = theme_aggregate(z, buckets, robust=robust)
 
     z_cols = [f"{c}_z" for c in feature_codes if f"{c}_z" in z.columns]
     z_for_features = z[z_cols]
-    wf = build_window_features(z_for_features, window_size=window_size, n_pca=3)
+    wf = build_window_features(z_for_features, window_size=window_size, n_pca=3, robust=robust)
 
     # Allow partial window overlap when history is short (common for macro +
     # 60-month window where z-valid rows only start ~2018).
     min_gap = max(window_size // 4, 6)
     if method == "primary":
-        res = primary_similarity(wf, n_clusters=n_clusters, top_k=20, min_gap=min_gap)
-    else:
+        res = primary_similarity(
+            wf, n_clusters=n_clusters, top_k=20, min_gap=min_gap, robust=robust,
+        )
+    elif method == "secondary":
         res = secondary_similarity(wf, top_k=20, min_gap=min_gap)
+    elif method == "cosine":
+        res = cosine_kmeans_similarity(
+            wf, n_clusters=n_clusters, top_k=20, min_gap=min_gap, robust=robust,
+        )
+    elif method == "gmm":
+        res = gmm_similarity(
+            wf, n_clusters=n_clusters, top_k=20, min_gap=min_gap, robust=robust,
+        )
+    else:
+        raise ValueError(f"unknown method: {method}")
 
-    rlabels = label_clusters(themes, res.labels, wf.end_dates)
+    rlabels = label_clusters(themes, res.labels, wf.end_dates, robust=robust)
     return {
         "panel": panel,
         "z": z,
@@ -193,6 +228,17 @@ with st.sidebar.expander("Frequency & transformation", expanded=False):
     zmode = st.radio("Z-score window", ["rolling", "expanding"], index=0, horizontal=True)
     rolling_years = st.slider("Rolling years", 5, 40, 20, step=5)
     min_years = st.slider("Minimum history (years)", 2, 15, 10, step=1)
+    robust = st.checkbox(
+        "Robust mode",
+        value=False,
+        help=(
+            "Winsorize inputs, z-score with median + MAD instead of mean + std, "
+            "use Spearman (rank) cross-series correlations, take median over "
+            "cluster members for regime labels, and swap Ledoit-Wolf for "
+            "Min-Covariance-Determinant in the Mahalanobis engine. Slower "
+            "but much less sensitive to COVID / GFC outliers."
+        ),
+    )
 
 with st.sidebar.expander("Windowing & clustering", expanded=True):
     wmin, wmax = MODE_WINDOW_RANGE[mode]
@@ -204,13 +250,16 @@ with st.sidebar.expander("Windowing & clustering", expanded=True):
     )
     n_clusters = st.slider("Number of regime clusters", 2, 10, 4)
 
+METHOD_LABELS = {
+    "primary":   "Primary: Mahalanobis + Ward",
+    "secondary": "Secondary: SBD + HDBSCAN",
+    "cosine":    "Cosine + KMeans (direction-based)",
+    "gmm":       "Euclidean + GMM (soft clusters)",
+}
 method = st.sidebar.radio(
     "Similarity methodology",
-    ["primary", "secondary"],
-    format_func=lambda x: (
-        "Primary: Mahalanobis + Ward" if x == "primary"
-        else "Secondary: SBD + HDBSCAN"
-    ),
+    list(METHOD_LABELS.keys()),
+    format_func=lambda x: METHOD_LABELS[x],
     index=0,
 )
 
@@ -289,6 +338,7 @@ try:
         feature_codes=tuple(feature_codes),
         n_clusters=n_clusters,
         method=method,
+        robust=robust,
         transforms_key=_encode_pairs({k: v for k, v in transforms.items() if k in all_codes}),
         buckets_key=_encode_pairs({k: v for k, v in buckets.items() if k in all_codes}),
     )
@@ -316,8 +366,8 @@ fwd_by_horizon = {
 # ---------------------------------------------------------------------------
 
 
-tab_overview, tab_data, tab_map, tab_ts, tab_analogs, tab_method = st.tabs(
-    ["Overview", "Data", "Regime map", "Time series", "Analogs", "Methodology"]
+tab_overview, tab_data, tab_cycle, tab_map, tab_ts, tab_analogs, tab_method = st.tabs(
+    ["Overview", "Data", "Cycle", "Regime map", "Time series", "Analogs", "Methodology"]
 )
 
 # --- Overview --------------------------------------------------------------
@@ -329,7 +379,7 @@ with tab_overview:
     col1.metric("Reference window ends", ref_end.strftime("%Y-%m-%d"))
     col2.metric("Today's regime", ref_label)
     col3.metric("Windows analyzed", f"{len(result['wf_end_dates']):,}")
-    col4.metric("Method", "Mahalanobis + Ward" if method == "primary" else "SBD + HDBSCAN")
+    col4.metric("Method", METHOD_LABELS[method].split(":", 1)[-1].strip())
 
     st.subheader("Top 5 analogs")
     compact = top_analogs.head(5).copy()
@@ -361,6 +411,167 @@ with tab_data:
 
     st.subheader("Panel tail")
     st.dataframe(panel[feature_codes].tail(10).round(3), use_container_width=True)
+
+# --- Cycle (Growth × Inflation / Growth × Monetary scatter) ----------------
+
+with tab_cycle:
+    st.subheader("Cycle view — growth / inflation / credit")
+
+    axis_choice = st.radio(
+        "Y axis",
+        ["Inflation", "Monetary / Financial"],
+        index=0,
+        horizontal=True,
+        help=(
+            "Growth-vs-inflation is the classic Merrill Lynch investment clock. "
+            "Swap to the monetary / financial axis for a credit-conditions clock "
+            "(tight spreads + high vol + tight policy = risk-off)."
+        ),
+    )
+    y_col = "inflation" if axis_choice == "Inflation" else "monetary"
+
+    themes_all = result["themes"].dropna(how="all")
+    cycle_df = themes_all[["growth", y_col]].dropna()
+    if len(cycle_df) < 13:
+        st.info("Not enough theme history for the cycle view.")
+    else:
+        # Breadcrumb offsets in periods — depend on target frequency
+        offset_map = {"M": {"1M": 1, "3M": 3, "6M": 6, "12M": 12},
+                      "W": {"1M": 4, "3M": 13, "6M": 26, "12M": 52},
+                      "D": {"1M": 21, "3M": 63, "6M": 126, "12M": 252}}
+        offsets = offset_map.get(freq, offset_map["M"])
+        today_pos = len(cycle_df) - 1
+
+        trail_points = []
+        for label, back in [("T-12M", offsets["12M"]), ("T-6M", offsets["6M"]),
+                            ("T-3M", offsets["3M"]), ("T-1M", offsets["1M"]),
+                            ("Today", 0)]:
+            pos = today_pos - back
+            if pos >= 0:
+                row = cycle_df.iloc[pos]
+                trail_points.append({
+                    "label": label,
+                    "date": cycle_df.index[pos],
+                    "growth": float(row["growth"]),
+                    y_col:   float(row[y_col]),
+                })
+        trail = pd.DataFrame(trail_points)
+
+        xr = float(max(1.5, cycle_df["growth"].abs().quantile(0.98) + 0.4))
+        yr = float(max(1.5, cycle_df[y_col].abs().quantile(0.98) + 0.4))
+
+        fig = go.Figure()
+
+        # Quadrant shading
+        if axis_choice == "Inflation":
+            quad_labels = {
+                "NE": "Reflation (high G, high I)",
+                "NW": "Stagflation (low G, high I)",
+                "SE": "Goldilocks (high G, low I)",
+                "SW": "Deflationary bust (low G, low I)",
+            }
+            quad_colors = {"NE": "rgba(255,170,60,0.10)",
+                           "NW": "rgba(220,60,60,0.10)",
+                           "SE": "rgba(60,200,100,0.10)",
+                           "SW": "rgba(60,120,220,0.10)"}
+        else:
+            quad_labels = {
+                "NE": "Expansion, tight credit (late cycle)",
+                "NW": "Slowdown, tight credit (risk-off)",
+                "SE": "Expansion, easy credit (risk-on)",
+                "SW": "Slowdown, easy credit (recovery)",
+            }
+            quad_colors = {"NE": "rgba(220,60,60,0.10)",
+                           "NW": "rgba(150,60,60,0.10)",
+                           "SE": "rgba(60,200,100,0.10)",
+                           "SW": "rgba(60,180,220,0.10)"}
+        for quad, (x0, x1, y0, y1) in {
+            "NE": (0, xr, 0, yr),
+            "NW": (-xr, 0, 0, yr),
+            "SE": (0, xr, -yr, 0),
+            "SW": (-xr, 0, -yr, 0),
+        }.items():
+            fig.add_shape(type="rect", x0=x0, y0=y0, x1=x1, y1=y1,
+                          fillcolor=quad_colors[quad], line=dict(width=0), layer="below")
+            fig.add_annotation(
+                x=(x0 + x1) / 2, y=(y0 + y1) / 2,
+                text=quad_labels[quad], showarrow=False,
+                font=dict(size=11, color="rgba(180,180,180,0.55)"),
+            )
+
+        # Zero axes
+        fig.add_shape(type="line", x0=-xr, x1=xr, y0=0, y1=0,
+                      line=dict(color="rgba(180,180,180,0.5)", width=1, dash="dot"))
+        fig.add_shape(type="line", x0=0, x1=0, y0=-yr, y1=yr,
+                      line=dict(color="rgba(180,180,180,0.5)", width=1, dash="dot"))
+
+        # Historical dots (light grey)
+        fig.add_trace(go.Scatter(
+            x=cycle_df["growth"], y=cycle_df[y_col],
+            mode="markers",
+            marker=dict(size=4, color="rgba(170,170,170,0.35)"),
+            hovertemplate="%{customdata|%Y-%m-%d}<br>G=%{x:.2f}  "
+                          f"{axis_choice[:1]}=%{{y:.2f}}<extra>history</extra>",
+            customdata=cycle_df.index,
+            name="history",
+        ))
+
+        # Event annotations
+        for date_str, label in CYCLE_EVENTS:
+            d = pd.Timestamp(date_str)
+            if d not in cycle_df.index:
+                # Snap to nearest available row
+                nearest = cycle_df.index[cycle_df.index.get_indexer([d], method="nearest")[0]]
+                d = nearest
+            if d in cycle_df.index:
+                row = cycle_df.loc[d]
+                fig.add_trace(go.Scatter(
+                    x=[row["growth"]], y=[row[y_col]],
+                    mode="markers+text",
+                    marker=dict(size=9, color="rgba(60,60,60,0.85)", symbol="diamond",
+                                line=dict(color="white", width=1)),
+                    text=[f" {label}"], textposition="top right",
+                    textfont=dict(size=10, color="rgba(220,220,220,0.9)"),
+                    hovertemplate=f"{label}<br>{d.date()}<extra></extra>",
+                    showlegend=False,
+                ))
+
+        # Breadcrumb trail
+        if not trail.empty:
+            fig.add_trace(go.Scatter(
+                x=trail["growth"], y=trail[y_col],
+                mode="lines+markers+text",
+                line=dict(color="#FFD700", width=2.5),
+                marker=dict(size=[8, 10, 12, 14, 20],
+                            color=["#FFB800", "#FFC400", "#FFD000", "#FFDC00", "#FFD700"],
+                            symbol=["circle"] * 4 + ["star"],
+                            line=dict(color="#D10000", width=2)),
+                text=trail["label"],
+                textposition="bottom center",
+                textfont=dict(size=11, color="#FFD700"),
+                hovertemplate="%{text}<br>%{customdata|%Y-%m-%d}<br>"
+                              f"G=%{{x:.2f}}  {axis_choice[:1]}=%{{y:.2f}}<extra></extra>",
+                customdata=trail["date"],
+                name="recent trail",
+            ))
+
+        fig.update_layout(
+            height=620,
+            xaxis=dict(title="Growth z-score", range=[-xr, xr], zeroline=False),
+            yaxis=dict(title=f"{axis_choice} z-score", range=[-yr, yr], zeroline=False),
+            showlegend=False,
+            hovermode="closest",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        cap = trail.iloc[-1] if not trail.empty else None
+        if cap is not None:
+            st.caption(
+                f"**Today ({cap['date'].date()}):** Growth z = {cap['growth']:+.2f}, "
+                f"{axis_choice} z = {cap[y_col]:+.2f}. "
+                f"Grey dots = every historical period. Diamonds = landmark events. "
+                f"Gold trail = T-12M → T-6M → T-3M → T-1M → today."
+            )
 
 # --- Regime map (2D embedding) ---------------------------------------------
 
@@ -570,6 +781,61 @@ with tab_analogs:
         fig2.add_trace(go.Scatter(y=blk.values, name=str(end.date()), opacity=0.55))
     fig2.update_layout(height=420, yaxis_title=f"{series_raw_col} (z)", xaxis_title="periods into window")
     st.plotly_chart(fig2, use_container_width=True)
+
+    # --- Backtest: treat each analog as one trade outcome ------------------
+    st.markdown("---")
+    st.subheader("Backtest — if today rhymes with these K analogs")
+    st.caption(
+        f"For each asset, the forward returns (or yield / spread changes) from "
+        f"the top {top_k} analogs at the **{horizon}** horizon are treated as "
+        f"the distribution of trade outcomes. Sharpe is mean ÷ std annualized."
+    )
+
+    stats = backtest_stats(fwd_k, horizon_key=horizon)
+    if stats.empty:
+        st.info("No valid forward outcomes for this horizon.")
+    else:
+        formatted = format_backtest(stats)
+        st.dataframe(formatted, use_container_width=True, hide_index=True)
+
+        dist_asset = st.selectbox(
+            "Distribution plot — asset",
+            list(stats["asset"]),
+            index=0,
+        )
+        kind = stats.loc[stats["asset"] == dist_asset, "kind"].iloc[0]
+        values = fwd_k[dist_asset].dropna()
+        if kind == "ret":
+            vals_display = values * 100.0
+            unit = "%"
+        else:
+            vals_display = values
+            unit = "bps"
+
+        fig3 = go.Figure()
+        fig3.add_trace(go.Box(
+            x=vals_display, boxpoints="all", jitter=0.6, pointpos=0,
+            marker=dict(color="#FFD700", size=9, line=dict(color="#D10000", width=1)),
+            line=dict(color="#888"), fillcolor="rgba(255,215,0,0.12)",
+            name=dist_asset, orientation="h",
+        ))
+        fig3.add_vline(x=0, line_width=1, line_color="rgba(180,180,180,0.5)",
+                       line_dash="dot")
+        mean_v = float(vals_display.mean())
+        fig3.add_vline(x=mean_v, line_width=2, line_color="#D10000",
+                       annotation_text=f"mean {mean_v:.2f}{unit}",
+                       annotation_position="top")
+        fig3.update_layout(
+            height=280, xaxis_title=f"{dist_asset} forward ({unit})",
+            yaxis=dict(showticklabels=False), showlegend=False,
+        )
+        st.plotly_chart(fig3, use_container_width=True)
+
+        st.caption(
+            "Hit rate = fraction of analogs with favorable outcome "
+            "(positive for price assets; tightening — i.e. falling rate or spread — "
+            "for yield and spread assets)."
+        )
 
 # --- Methodology -----------------------------------------------------------
 

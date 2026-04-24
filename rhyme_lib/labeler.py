@@ -71,21 +71,24 @@ def label_clusters(
     themes: pd.DataFrame,
     labels: np.ndarray,
     end_dates: pd.DatetimeIndex,
+    robust: bool = False,
 ) -> list[RegimeLabel]:
-    """For each cluster, compute mean growth/inflation/financial z and assign
-    a label. themes is the full theme-aggregated z panel; labels and
-    end_dates align window-for-window."""
+    """For each cluster, compute the center growth/inflation/financial z and
+    assign a label. themes is the full theme-aggregated z panel; labels and
+    end_dates align window-for-window. If `robust`, uses median instead of
+    mean to summarize each cluster."""
     aligned = themes.reindex(end_dates)
     missing_axes = [c for c in (GROWTH, INFL, FIN) if c not in aligned.columns]
     if missing_axes:
         raise ValueError(f"themes is missing required columns: {missing_axes}")
 
+    reducer = np.nanmedian if robust else np.nanmean
     out: list[RegimeLabel] = []
     for cluster in sorted(np.unique(labels)):
         mask = labels == cluster
-        g = float(aligned.loc[mask, GROWTH].mean())
-        i = float(aligned.loc[mask, INFL].mean())
-        f = float(aligned.loc[mask, FIN].mean())
+        g = float(reducer(aligned.loc[mask, GROWTH].values))
+        i = float(reducer(aligned.loc[mask, INFL].values))
+        f = float(reducer(aligned.loc[mask, FIN].values))
         base = _base_label(g, i)
         suffix = _risk_suffix(f)
         lbl = "Unclustered" if cluster == -1 else (base + suffix)

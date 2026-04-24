@@ -23,7 +23,12 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from rhyme_lib.backtest import backtest_stats, format_backtest
+from rhyme_lib.backtest import (
+    backtest_stats,
+    format_backtest,
+    format_walk_forward,
+    walk_forward_backtest,
+)
 from rhyme_lib.features import build_window_features
 from rhyme_lib.forward_returns import DEFAULT_ASSETS, DEFAULT_HORIZONS_WEEKS, forward_returns
 from rhyme_lib.labeler import label_clusters, label_map
@@ -169,6 +174,54 @@ def _cached_pipeline(
         "sim_method": res.method,
         "regime_labels": [asdict(r) for r in rlabels],
     }
+
+
+@st.cache_data(show_spinner=False)
+def _cached_walk_forward(
+    panel_key: str,
+    panel_bytes: bytes,
+    freq: str,
+    method: str,
+    robust: bool,
+    top_k: int,
+    horizon_key: str,
+    window_size: int,
+    feature_codes_key: str,
+    zmode: str,
+    rolling_years: int,
+    min_years: int,
+    transforms_key: str,
+    buckets_key: str,
+):
+    """Walk-forward backtest cache. Signature mirrors _cached_pipeline so we
+    only recompute when something actually changed. We rebuild the WindowFeatures
+    here rather than serialize the existing result dict — the numpy arrays
+    aren't trivially cacheable as kwargs."""
+    panel = pd.read_parquet(io.BytesIO(panel_bytes))
+    panel.index = pd.to_datetime(panel.index)
+    transforms_d = dict(_decode_pairs(transforms_key))
+    buckets_d = dict(_decode_pairs(buckets_key))
+    codes = tuple(feature_codes_key.split(",")) if feature_codes_key else ()
+
+    z_local = transform_and_zscore(
+        panel, transforms_d, freq=freq, mode=zmode,
+        rolling_years=rolling_years, min_years=min_years, robust=robust,
+    )
+    z_cols = [f"{c}_z" for c in codes if f"{c}_z" in z_local.columns]
+    wf = build_window_features(z_local[z_cols], window_size=window_size, n_pca=3, robust=robust)
+
+    return walk_forward_backtest(
+        wf_features=wf.features,
+        wf_end_dates=wf.end_dates,
+        wf_panel_slice=wf.panel_slice,
+        window_size=wf.window_size,
+        panel_daily=panel,
+        freq=freq,
+        method=method,
+        robust=robust,
+        top_k=top_k,
+        horizon_key=horizon_key,
+    )
 
 
 def _encode_pairs(d: dict[str, str]) -> str:
@@ -782,13 +835,16 @@ with tab_analogs:
     fig2.update_layout(height=420, yaxis_title=f"{series_raw_col} (z)", xaxis_title="periods into window")
     st.plotly_chart(fig2, use_container_width=True)
 
-    # --- Backtest: treat each analog as one trade outcome ------------------
+    # --- Cross-sectional: dispersion of today's K analog outcomes ----------
     st.markdown("---")
-    st.subheader("Backtest — if today rhymes with these K analogs")
+    st.subheader("Analog consensus — distribution of today's top K outcomes")
     st.caption(
-        f"For each asset, the forward returns (or yield / spread changes) from "
-        f"the top {top_k} analogs at the **{horizon}** horizon are treated as "
-        f"the distribution of trade outcomes. Sharpe is mean ÷ std annualized."
+        f"The forward returns (or yield / spread changes) from the top {top_k} "
+        f"analogs at the **{horizon}** horizon are treated as the distribution "
+        f"of possible outcomes if today rhymes with those regimes. "
+        f"**This is not a strategy Sharpe** — it only describes how tightly the "
+        f"analogs agree. For honest return / vol / drawdown numbers see the "
+        f"walk-forward backtest below."
     )
 
     stats = backtest_stats(fwd_k, horizon_key=horizon)
@@ -832,10 +888,106 @@ with tab_analogs:
         st.plotly_chart(fig3, use_container_width=True)
 
         st.caption(
-            "Hit rate = fraction of analogs with favorable outcome "
+            "Agree = fraction of analogs with favorable outcome "
             "(positive for price assets; tightening — i.e. falling rate or spread — "
             "for yield and spread assets)."
         )
+
+    # --- Walk-forward backtest (no look-ahead) -----------------------------
+    st.markdown("---")
+    st.subheader("Walk-forward backtest — no look-ahead")
+    st.caption(
+        f"At every historical decision date **T**, we rebuild the similarity "
+        f"engine using only features from strictly before T − {horizon} (so every "
+        f"candidate analog's forward return has already been realized). The "
+        f"position is **sign(mean forward return of the top {top_k} past analogs)**; "
+        f"the strategy return is position × realized(T → T + {horizon}). Trades are "
+        f"non-overlapping (step = horizon). Early history uses fewer analogs "
+        f"because fewer past windows exist — that's intentional. "
+        f"Sharpe is annualized ({int(round(12 if horizon == '1m' else 4 if horizon == '3m' else 1))} trades/year)."
+    )
+
+    run_wf = st.checkbox(
+        "Run walk-forward backtest (slower — re-fits the engine at every T)",
+        value=False,
+    )
+    if run_wf:
+        with st.spinner("Running walk-forward… re-fitting the engine at every historical T"):
+            try:
+                wf_result = _cached_walk_forward(
+                    panel_key=panel_source_name,
+                    panel_bytes=_panel_bytes.getvalue(),
+                    freq=freq,
+                    method=method,
+                    robust=robust,
+                    top_k=top_k,
+                    horizon_key=horizon,
+                    window_size=window_size,
+                    feature_codes_key=",".join(feature_codes),
+                    zmode=zmode,
+                    rolling_years=rolling_years,
+                    min_years=min_years,
+                    transforms_key=_encode_pairs(
+                        {k: v for k, v in transforms.items() if k in all_codes}
+                    ),
+                    buckets_key=_encode_pairs(
+                        {k: v for k, v in buckets.items() if k in all_codes}
+                    ),
+                )
+            except Exception as e:
+                st.error(f"Walk-forward failed: {e}")
+                wf_result = None
+
+        if wf_result is not None:
+            wf_stats = wf_result["stats"]
+            if wf_stats.empty:
+                st.info(
+                    "Not enough past history for a walk-forward backtest at this "
+                    "horizon / window combo — widen rolling history or shrink the "
+                    "window."
+                )
+            else:
+                st.dataframe(
+                    format_walk_forward(wf_stats),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+                trades = wf_result["trades"]
+                equity = wf_result["equity"]
+                if len(trades) > 0 and equity:
+                    st.markdown("**Equity curves** (cumulative, position-signed)")
+                    eq_fig = go.Figure()
+                    for asset, curve in equity.items():
+                        kind = DEFAULT_ASSETS.get(asset, "ret")
+                        y = (curve - 1.0) * 100.0 if kind == "ret" else curve
+                        eq_fig.add_trace(go.Scatter(
+                            x=curve.index, y=y, mode="lines", name=asset,
+                        ))
+                    eq_fig.add_hline(y=0, line_width=1,
+                                     line_color="rgba(180,180,180,0.5)",
+                                     line_dash="dot")
+                    eq_fig.update_layout(
+                        height=400,
+                        yaxis_title="cumulative (% for prices, bps for yields/spreads)",
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(eq_fig, use_container_width=True)
+
+                    with st.expander(f"Trade log ({len(trades)} trades)", expanded=False):
+                        show = trades.copy()
+                        show["date"] = pd.to_datetime(show["date"]).dt.date
+                        st.dataframe(show, use_container_width=True, hide_index=True)
+
+                first_trade = trades["date"].min()
+                last_trade = trades["date"].max()
+                st.caption(
+                    f"{len(trades)} non-overlapping trades from "
+                    f"{pd.Timestamp(first_trade).date()} to "
+                    f"{pd.Timestamp(last_trade).date()}. "
+                    f"Signal at each T uses only windows ending ≤ T − {horizon}; "
+                    f"no data from after T is used to form the position."
+                )
 
 # --- Methodology -----------------------------------------------------------
 

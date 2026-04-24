@@ -19,15 +19,16 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import mahalanobis
-from sklearn.cluster import AgglomerativeClustering
-from sklearn.covariance import LedoitWolf
+from sklearn.cluster import AgglomerativeClustering, KMeans
+from sklearn.covariance import LedoitWolf, MinCovDet
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
-from sklearn.preprocessing import StandardScaler
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler, normalize
 
 from .features import WindowFeatures
 
-Method = Literal["primary", "secondary"]
+Method = Literal["primary", "secondary", "cosine", "gmm"]
 
 
 @dataclass
@@ -39,9 +40,19 @@ class SimilarityResult:
     method: Method
 
 
-def _ledoit_wolf_inv(X: np.ndarray) -> np.ndarray:
-    lw = LedoitWolf().fit(X)
-    cov = lw.covariance_
+def _cov_inv(X: np.ndarray, robust: bool = False) -> np.ndarray:
+    if robust:
+        # MinCovDet needs n > 2*d; fall back to Ledoit-Wolf if not enough data.
+        n, d = X.shape
+        if n > 2 * d + 10:
+            try:
+                cov = MinCovDet(support_fraction=None, random_state=0).fit(X).covariance_
+            except Exception:
+                cov = LedoitWolf().fit(X).covariance_
+        else:
+            cov = LedoitWolf().fit(X).covariance_
+    else:
+        cov = LedoitWolf().fit(X).covariance_
     d = cov.shape[0]
     reg = 1e-6 * np.trace(cov) / max(d, 1)
     return np.linalg.pinv(cov + reg * np.eye(d))
@@ -54,43 +65,140 @@ def _standardize_features(X: np.ndarray) -> np.ndarray:
     return Xs
 
 
+def _build_top_df(
+    dists: np.ndarray,
+    labels: np.ndarray,
+    end_dates: pd.DatetimeIndex,
+    ref_idx: int,
+    gap: int,
+    top_k: int,
+) -> pd.DataFrame:
+    idx = np.arange(len(dists))
+    mask = np.abs(idx - ref_idx) >= gap
+    ranked = idx[mask][np.argsort(dists[mask])]
+    top = ranked[:top_k]
+    return pd.DataFrame(
+        {
+            "rank": np.arange(1, len(top) + 1),
+            "end_date": end_dates[top],
+            "distance": dists[top],
+            "cluster": labels[top],
+        }
+    )
+
+
 def primary_similarity(
     wf: WindowFeatures,
     n_clusters: int,
     reference_idx: int | None = None,
     top_k: int = 10,
     min_gap: int | None = None,
+    robust: bool = False,
 ) -> SimilarityResult:
     X = _standardize_features(wf.features)
     ref_idx = len(X) - 1 if reference_idx is None else reference_idx
     gap = wf.window_size if min_gap is None else min_gap
 
-    vi = _ledoit_wolf_inv(X)
+    vi = _cov_inv(X, robust=robust)
     ref = X[ref_idx]
     dists = np.array([mahalanobis(x, ref, vi) for x in X])
 
     model = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
     labels = model.fit_predict(X)
 
-    idx = np.arange(len(X))
-    mask = np.abs(idx - ref_idx) >= gap
-    ranked = idx[mask][np.argsort(dists[mask])]
-    top = ranked[:top_k]
-    top_df = pd.DataFrame(
-        {
-            "rank": np.arange(1, len(top) + 1),
-            "end_date": wf.end_dates[top],
-            "distance": dists[top],
-            "cluster": labels[top],
-        }
+    return SimilarityResult(
+        labels=labels,
+        distances=dists,
+        reference_idx=ref_idx,
+        top_analogs=_build_top_df(dists, labels, wf.end_dates, ref_idx, gap, top_k),
+        method="primary",
     )
+
+
+def cosine_kmeans_similarity(
+    wf: WindowFeatures,
+    n_clusters: int,
+    reference_idx: int | None = None,
+    top_k: int = 10,
+    min_gap: int | None = None,
+    robust: bool = False,
+) -> SimilarityResult:
+    """Direction-based similarity: cosine distance between L2-normalized
+    feature vectors, KMeans clustering on the same normalized space
+    (spherical k-means via unit-vector centroids)."""
+    X = _standardize_features(wf.features)
+    Xn = normalize(X, norm="l2", axis=1)
+    ref_idx = len(X) - 1 if reference_idx is None else reference_idx
+    gap = wf.window_size if min_gap is None else min_gap
+
+    ref = Xn[ref_idx]
+    # cosine distance = 1 - cosine similarity
+    dists = 1.0 - Xn @ ref
+
+    model = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
+    labels = model.fit_predict(Xn)
 
     return SimilarityResult(
         labels=labels,
         distances=dists,
         reference_idx=ref_idx,
-        top_analogs=top_df,
-        method="primary",
+        top_analogs=_build_top_df(dists, labels, wf.end_dates, ref_idx, gap, top_k),
+        method="cosine",
+    )
+
+
+def _loglik_signature(gmm: GaussianMixture, X: np.ndarray) -> np.ndarray:
+    """Per-component weighted log-likelihood for each sample: log[π_k N(x|μ_k,Σ_k)].
+    Shape (n_samples, n_components). Used as a "regime fingerprint" — a window's
+    similarity to another is how close their fingerprints are."""
+    return gmm._estimate_weighted_log_prob(X)
+
+
+def gmm_similarity(
+    wf: WindowFeatures,
+    n_clusters: int,
+    reference_idx: int | None = None,
+    top_k: int = 10,
+    min_gap: int | None = None,
+    robust: bool = False,
+) -> SimilarityResult:
+    """Soft-probabilistic clustering via a Gaussian Mixture Model. Distance is
+    Euclidean distance between per-component log-likelihood signatures —
+    i.e. each window is represented by its likelihood under each of the k
+    fitted Gaussian regimes, and we compare those signatures. This is
+    genuinely distinct from plain Euclidean / cosine on features: two
+    windows with different raw features can have identical signatures if
+    they are equally likely under the same mix of learned regimes, and
+    vice versa."""
+    X = _standardize_features(wf.features)
+    ref_idx = len(X) - 1 if reference_idx is None else reference_idx
+    gap = wf.window_size if min_gap is None else min_gap
+
+    cov_type = "diag"  # robust to high-d features; full covariance would overfit
+    gmm = GaussianMixture(
+        n_components=n_clusters,
+        covariance_type=cov_type,
+        random_state=0,
+        reg_covar=1e-4,
+        n_init=3,
+    )
+    gmm.fit(X)
+    sig = _loglik_signature(gmm, X)
+    # Clip far-from-any-regime outliers then column-standardize the signature
+    # so the distance is on a unit scale regardless of data dimension.
+    lo = np.quantile(sig, 0.01, axis=0)
+    hi = np.quantile(sig, 0.99, axis=0)
+    sig = np.clip(sig, lo, hi)
+    sig = (sig - sig.mean(axis=0)) / (sig.std(axis=0) + 1e-8)
+    dists = np.linalg.norm(sig - sig[ref_idx], axis=1)
+    labels = gmm.predict(X)
+
+    return SimilarityResult(
+        labels=labels,
+        distances=dists,
+        reference_idx=ref_idx,
+        top_analogs=_build_top_df(dists, labels, wf.end_dates, ref_idx, gap, top_k),
+        method="gmm",
     )
 
 

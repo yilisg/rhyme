@@ -68,11 +68,17 @@ NBER_RECESSIONS: list[tuple[str, str]] = [
 ]
 
 # Big-ticket macro / market events — annotated on the Cycle scatter so the
-# chart reads as history, not just a blob of dots.
+# chart reads as history, not just a blob of dots.  Authoritative dates:
+# OPEC embargo announcement Oct-1973; Volcker fed-funds peak Jun-1981
+# (FOMC raised to 20% intra-month, monthly avg peaked at 19.10% in Jun-1981);
+# Black Monday Oct 19 1987; S&L peak collapse 1990 (recession start Jul 1990);
+# Dot-com NASDAQ peak Mar 10 2000; Lehman bankruptcy Sep 15 2008; COVID-19
+# market trough Mar 23 2020; 2022 CPI YoY peak Jun-2022.
 CYCLE_EVENTS: list[tuple[str, str]] = [
-    ("1973-11-30", "OPEC oil shock"),
-    ("1980-03-31", "Volcker peak"),
+    ("1973-10-31", "OPEC oil shock"),
+    ("1981-06-30", "Volcker peak"),
     ("1987-10-31", "Black Monday"),
+    ("1990-07-31", "S&L / 1990 recession"),
     ("2000-03-31", "Dot-com peak"),
     ("2008-09-30", "Lehman / GFC"),
     ("2011-08-31", "US debt downgrade"),
@@ -246,15 +252,51 @@ def _decode_pairs(s: str) -> list[tuple[str, str]]:
 st.sidebar.title("Rhyme")
 st.sidebar.caption("History doesn't repeat, but it rhymes.")
 
-data_choice = st.sidebar.radio(
+DATA_SOURCE_OPTIONS = ["Public", "Private", "Custom"]
+data_choice = st.sidebar.selectbox(
     "Panel source",
-    ["Default (built-in)", "Upload CSV or JSON"],
-    horizontal=False,
+    DATA_SOURCE_OPTIONS,
+    index=0,
+    help=(
+        "Public: built-in FRED + Yahoo panel.  "
+        "Private: read tabula's long-format parquet (defaults to its "
+        "standard output path).  "
+        "Custom: upload a CSV or parquet (wide or long format)."
+    ),
 )
 
 uploaded = None
-if data_choice == "Upload CSV or JSON":
-    uploaded = st.sidebar.file_uploader("File (first column = date)", type=["csv", "json"])
+private_path: str | None = None
+TABULA_DEFAULT_PATH = "/Users/yili/Desktop/Claude/tabula/data/output/tabula_panel.parquet"
+if data_choice == "Private":
+    private_path = st.sidebar.text_input(
+        "Tabula parquet path",
+        value=TABULA_DEFAULT_PATH,
+        help="Long-format parquet: series_id, observation_date, value, source.",
+    )
+    private_upload = st.sidebar.file_uploader(
+        "...or upload a tabula parquet directly",
+        type=["parquet"],
+        key="private_upload",
+    )
+    if private_upload is not None:
+        uploaded = private_upload
+elif data_choice == "Custom":
+    uploaded = st.sidebar.file_uploader(
+        "File (CSV: first column = date; parquet: long-format with series_id/observation_date/value)",
+        type=["csv", "parquet", "json"],
+    )
+
+long_term_model = st.sidebar.checkbox(
+    "Long-term model (allow pre-2000 history)",
+    value=False,
+    help=(
+        "Off: panel observations before 2000-01-01 are filtered out — this "
+        "matches the public FRED+Yahoo coverage floor for most series.  "
+        "On: lets full GFD-sourced (or other) deep history through.  Useful "
+        "when you've loaded a private long panel that goes back to e.g. 1950."
+    ),
+)
 
 mode = st.sidebar.radio(
     "Mode",
@@ -325,19 +367,102 @@ method = st.sidebar.radio(
 # ---------------------------------------------------------------------------
 
 
+def _reshape_long_to_wide(long_df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot a long-format panel (series_id / observation_date / value) into
+    rhyme's wide schema (date index, one column per series).
+
+    Tabula-style long format is detected by the presence of all three of
+    series_id, observation_date, value.  Other column names (case-
+    insensitive aliases) are also accepted: code/series, date, val.
+    """
+    cols = {c.lower(): c for c in long_df.columns}
+    date_col = (
+        cols.get("observation_date")
+        or cols.get("date")
+        or cols.get("obs_date")
+        or cols.get("period")
+    )
+    series_col = (
+        cols.get("series_id")
+        or cols.get("series")
+        or cols.get("code")
+        or cols.get("ticker")
+    )
+    value_col = cols.get("value") or cols.get("val") or cols.get("v")
+    if not (date_col and series_col and value_col):
+        raise ValueError(
+            "long-format requires columns for date, series_id, value (got "
+            f"{list(long_df.columns)})"
+        )
+    work = long_df[[date_col, series_col, value_col]].copy()
+    work[date_col] = pd.to_datetime(work[date_col])
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    wide = (
+        work.pivot_table(index=date_col, columns=series_col, values=value_col, aggfunc="last")
+        .sort_index()
+    )
+    wide.columns.name = None
+    return wide
+
+
 def _load_upload(file) -> tuple[pd.DataFrame, dict[str, str], dict[str, str]]:
+    """Read user-supplied panel from CSV / JSON / parquet.  Auto-detects
+    long-format parquet (tabula's schema) and pivots into wide."""
     name = getattr(file, "name", "").lower()
-    raw = pd.read_json(file) if name.endswith(".json") else pd.read_csv(file)
-    date_col = raw.columns[0]
-    raw[date_col] = pd.to_datetime(raw[date_col])
-    raw = raw.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
-    raw = raw.dropna(how="all")
-    transforms = infer_transforms(raw)
-    buckets = {c: "monetary" for c in raw.columns}
-    return raw, transforms, buckets
+    if name.endswith(".parquet"):
+        raw = pd.read_parquet(file)
+        if "value" in {c.lower() for c in raw.columns}:
+            wide = _reshape_long_to_wide(raw)
+        else:
+            # already wide; date is the index or the first column
+            if not isinstance(raw.index, pd.DatetimeIndex):
+                date_col = raw.columns[0]
+                raw[date_col] = pd.to_datetime(raw[date_col])
+                raw = raw.set_index(date_col)
+            wide = raw.sort_index().apply(pd.to_numeric, errors="coerce")
+    elif name.endswith(".json"):
+        raw = pd.read_json(file)
+        date_col = raw.columns[0]
+        raw[date_col] = pd.to_datetime(raw[date_col])
+        wide = raw.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
+    else:
+        raw = pd.read_csv(file)
+        if "value" in {c.lower() for c in raw.columns} and (
+            "series_id" in {c.lower() for c in raw.columns}
+            or "series" in {c.lower() for c in raw.columns}
+        ):
+            wide = _reshape_long_to_wide(raw)
+        else:
+            date_col = raw.columns[0]
+            raw[date_col] = pd.to_datetime(raw[date_col])
+            wide = raw.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
+    wide = wide.dropna(how="all")
+    transforms = infer_transforms(wide)
+    buckets = {c: "monetary" for c in wide.columns}
+    return wide, transforms, buckets
 
 
-if data_choice == "Default (built-in)":
+def _load_private_path(path: str) -> tuple[pd.DataFrame, dict[str, str], dict[str, str]]:
+    """Read tabula-style long-format parquet from a filesystem path."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Private parquet not found: {path}")
+    raw = pd.read_parquet(p)
+    if "value" in {c.lower() for c in raw.columns}:
+        wide = _reshape_long_to_wide(raw)
+    else:
+        if not isinstance(raw.index, pd.DatetimeIndex):
+            date_col = raw.columns[0]
+            raw[date_col] = pd.to_datetime(raw[date_col])
+            raw = raw.set_index(date_col)
+        wide = raw.sort_index().apply(pd.to_numeric, errors="coerce")
+    wide = wide.dropna(how="all")
+    transforms = infer_transforms(wide)
+    buckets = {c: "monetary" for c in wide.columns}
+    return wide, transforms, buckets
+
+
+if data_choice == "Public":
     try:
         panel, meta = _cached_default_panel()
     except FileNotFoundError as e:
@@ -350,39 +475,39 @@ if data_choice == "Default (built-in)":
     feature_codes = [c for c in all_codes if DEFAULT_BUCKETS.get(c) in bucket_selection]
     transforms = DEFAULT_TRANSFORMS
     buckets = DEFAULT_BUCKETS
-    panel_source_name = "default"
-    # Drop series from the feature set (but keep in panel/themes) when they
-    # don't extend near the panel's current edge or don't cover enough history
-    # for a reasonable window. `dropna(how="any")` in feature building means
-    # a single stale/short series otherwise collapses the whole matrix.
-    _panel_end = pd.to_datetime(panel.index.max())
-    _stale_cutoff = _panel_end - pd.Timedelta(days=400)
-    _short_cutoff = _panel_end - pd.Timedelta(days=365 * 10)
-    _excluded = []
-    _kept = []
-    for c in feature_codes:
-        s = panel[c].dropna()
-        if s.empty or s.index.max() < _stale_cutoff or s.index.min() > _short_cutoff:
-            _excluded.append(c)
+    panel_source_name = "public"
+    # The old stale/short-series filter (a workaround for dropna(how="any")
+    # in build_window_features) is gone now that features are NaN-tolerant.
+    # A series with limited coverage simply contributes to whatever windows
+    # it overlaps with — see rhyme_lib/features.py for the active-mask
+    # design.  We still drop columns that have *no* data anywhere.
+    feature_codes = [c for c in feature_codes if panel[c].notna().any()]
+elif data_choice in ("Private", "Custom"):
+    src_label = data_choice.lower()
+    try:
+        if uploaded is not None:
+            panel, transforms, buckets = _load_upload(uploaded)
+            panel_source_name = getattr(uploaded, "name", f"{src_label}-upload")
+        elif data_choice == "Private" and private_path:
+            panel, transforms, buckets = _load_private_path(private_path)
+            panel_source_name = f"private:{Path(private_path).name}"
         else:
-            _kept.append(c)
-    if _excluded:
-        st.sidebar.caption(
-            f"Excluded from features (kept in themes): {', '.join(_excluded)}"
-        )
-    feature_codes = _kept
-else:
-    if uploaded is None:
-        st.info("Upload a CSV or JSON in the sidebar (first column = date, rest numeric).")
+            st.info(
+                "Choose a file or set the path in the sidebar.  "
+                "Private mode reads tabula's long-format parquet "
+                "(series_id / observation_date / value)."
+            )
+            st.stop()
+    except (FileNotFoundError, ValueError) as e:
+        st.error(f"Failed to load {src_label} panel: {e}")
         st.stop()
-    panel, transforms, buckets = _load_upload(uploaded)
     meta = pd.DataFrame(
         [
             {
                 "code": c,
                 "bucket": buckets[c],
                 "transform": transforms[c],
-                "source": "uploaded",
+                "source": src_label,
                 "n_obs": int(panel[c].notna().sum()),
                 "start": panel[c].dropna().index.min() if panel[c].notna().any() else None,
                 "end":   panel[c].dropna().index.max() if panel[c].notna().any() else None,
@@ -391,8 +516,23 @@ else:
         ]
     )
     all_codes = list(panel.columns)
-    feature_codes = list(panel.columns)
-    panel_source_name = getattr(uploaded, "name", "uploaded")
+    feature_codes = [c for c in panel.columns if panel[c].notna().any()]
+else:
+    st.error(f"Unknown panel source: {data_choice}")
+    st.stop()
+
+# Long-term-model toggle: enforce a 2000-01-01 floor when off so we mimic
+# the public-source coverage floor regardless of the underlying source.
+if not long_term_model:
+    floor = pd.Timestamp("2000-01-01")
+    if panel.index.min() < floor:
+        panel = panel.loc[panel.index >= floor]
+        if "start" in meta.columns:
+            meta = meta.assign(
+                start=meta["start"].apply(
+                    lambda d: max(pd.Timestamp(d), floor) if pd.notna(d) else d
+                )
+            )
 
 if not feature_codes:
     st.warning(f"No series in the {mode} buckets — check your panel bucket tags.")

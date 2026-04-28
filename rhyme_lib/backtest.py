@@ -26,11 +26,15 @@ from typing import Mapping
 
 import numpy as np
 import pandas as pd
-from scipy.spatial.distance import mahalanobis
-from sklearn.preprocessing import StandardScaler, normalize
 
 from .forward_returns import DEFAULT_ASSETS, DEFAULT_HORIZONS_WEEKS
-from .similarity import _cov_inv, _loglik_signature, _sbd
+from .similarity import (
+    _cov_inv,
+    _loglik_signature,
+    _pairwise_mahalanobis,
+    _sbd,
+    _standardize_with_impute,
+)
 
 HORIZON_PERIODS_PER_YEAR = {"1m": 12.0, "3m": 4.0, "12m": 1.0}
 HORIZON_PERIODS_BY_FREQ: dict[str, dict[str, int]] = {
@@ -165,24 +169,42 @@ def _distances_past_only(
     robust: bool,
 ) -> np.ndarray:
     """Distance from window T_idx to every candidate analog in [0, valid_end],
-    using ONLY features in that past range to fit scalers / covariances."""
+    using ONLY features in that past range to fit scalers / covariances.
+
+    NaN-aware: ``wf_features`` may contain NaNs (a column inactive in a
+    given window). Standardize NaN-aware on past-only stats; the
+    Mahalanobis distance uses the per-pair active-mask intersection so a
+    window with limited coverage isn't artificially close to anything.
+    """
     past_X = wf_features[: valid_end + 1]
     ref = wf_features[T_idx]
 
-    # Past-only standardization (scaler leakage-free)
-    scaler = StandardScaler().fit(past_X)
-    past_Xs = np.nan_to_num(scaler.transform(past_X), nan=0.0, posinf=0.0, neginf=0.0)
-    ref_s = np.nan_to_num(
-        scaler.transform(ref.reshape(1, -1))[0], nan=0.0, posinf=0.0, neginf=0.0,
-    )
+    # Past-only standardization, NaN-aware.
+    past_Xs, means, stds, valid = _standardize_with_impute(past_X)
+    past_nan_mask = (~np.isnan(past_X))[:, valid]
+    past_Xs = past_Xs[:, valid]
+    ref_active = ~np.isnan(ref)
+    # Re-impute ref against past-only means (NaN where neither column is active in past).
+    ref_s = np.where(np.isnan(ref), 0.0, (ref - means) / stds)
+    ref_s = ref_s[valid]
+    ref_mask = ref_active[valid]
 
     if method == "primary":
         vi = _cov_inv(past_Xs, robust=robust)
-        return np.array([mahalanobis(x, ref_s, vi) for x in past_Xs])
+        return _pairwise_mahalanobis(past_Xs, past_nan_mask, ref_s, ref_mask, vi)
     if method == "cosine":
-        Xn = normalize(past_Xs, norm="l2", axis=1)
-        rn = ref_s / (np.linalg.norm(ref_s) + 1e-12)
-        return 1.0 - Xn @ rn
+        n = past_Xs.shape[0]
+        out = np.zeros(n)
+        for i in range(n):
+            common = past_nan_mask[i] & ref_mask
+            if common.sum() < 5:
+                out[i] = np.nan
+                continue
+            a = ref_s[common]
+            b = past_Xs[i, common]
+            denom = np.linalg.norm(a) * np.linalg.norm(b)
+            out[i] = 1.0 - (a @ b) / denom if denom > 0 else 1.0
+        return out
     if method == "gmm":
         # Fit GMM on past-only; distance = Euclidean on per-component weighted
         # log-likelihood signatures (matches live gmm_similarity).
@@ -212,7 +234,12 @@ def _distances_past_only(
         for i in range(valid_end + 1):
             w = wf_panel_slice.iloc[i : i + window_size].to_numpy(dtype=float)
             d = w.shape[1]
-            out[i] = float(np.mean([_sbd(ref_block[:, j], w[:, j]) for j in range(d)]))
+            vals = []
+            for j in range(d):
+                v = _sbd(ref_block[:, j], w[:, j])
+                if np.isfinite(v):
+                    vals.append(v)
+            out[i] = float(np.mean(vals)) if vals else np.nan
         return out
     raise ValueError(f"unknown method: {method}")
 

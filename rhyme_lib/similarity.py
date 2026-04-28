@@ -532,18 +532,20 @@ def block_bootstrap_null_distance(
     ref_active = nan_mask[ref_idx]
     out = np.zeros(n_reps)
 
-    n_blocks = max(1, n // block_size)
+    # Build non-overlapping blocks that exactly tile the array.  The last
+    # block may be shorter than block_size — that's fine; ordering among
+    # blocks is what matters for breaking serial structure.
+    block_starts = list(range(0, n, block_size))
+    blocks = [
+        np.arange(s, min(s + block_size, n)) for s in block_starts
+    ]
+
     for r in range(n_reps):
-        order = rng.permutation(n_blocks)
-        idx: list[int] = []
-        for b in order:
-            start = b * block_size
-            idx.extend(range(start, min(start + block_size, n)))
-        idx = np.asarray(idx[:n], dtype=int)
+        order = rng.permutation(len(blocks))
+        idx = np.concatenate([blocks[b] for b in order])
+        # ``idx`` is exactly length n by construction.
         Xp = Xs[idx]
         Mp = nan_mask[idx]
-        # Best-analog distance under the permutation, excluding a small gap
-        # around ref_idx (preserve the original ref).
         local = _pairwise_mahalanobis(Xp, Mp, ref, ref_active, vi_full)
         valid_idx = np.arange(n)
         keep = (np.abs(valid_idx - ref_idx) >= min_gap) & np.isfinite(local)

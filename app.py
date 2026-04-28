@@ -22,6 +22,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from sklearn.cluster import AgglomerativeClustering
 
 from rhyme_lib.backtest import (
     backtest_stats,
@@ -39,10 +40,15 @@ from rhyme_lib.panel import (
     load_default_panel,
 )
 from rhyme_lib.similarity import (
+    _cov_inv,
+    _pairwise_mahalanobis,
+    _standardize_with_impute,
+    block_bootstrap_null_distance,
     cosine_kmeans_similarity,
     embed_2d,
     gmm_similarity,
     primary_similarity,
+    regime_probabilities,
     secondary_similarity,
 )
 from rhyme_lib.transforms import (
@@ -68,11 +74,17 @@ NBER_RECESSIONS: list[tuple[str, str]] = [
 ]
 
 # Big-ticket macro / market events — annotated on the Cycle scatter so the
-# chart reads as history, not just a blob of dots.
+# chart reads as history, not just a blob of dots.  Authoritative dates:
+# OPEC embargo announcement Oct-1973; Volcker fed-funds peak Jun-1981
+# (FOMC raised to 20% intra-month, monthly avg peaked at 19.10% in Jun-1981);
+# Black Monday Oct 19 1987; S&L peak collapse 1990 (recession start Jul 1990);
+# Dot-com NASDAQ peak Mar 10 2000; Lehman bankruptcy Sep 15 2008; COVID-19
+# market trough Mar 23 2020; 2022 CPI YoY peak Jun-2022.
 CYCLE_EVENTS: list[tuple[str, str]] = [
-    ("1973-11-30", "OPEC oil shock"),
-    ("1980-03-31", "Volcker peak"),
+    ("1973-10-31", "OPEC oil shock"),
+    ("1981-06-30", "Volcker peak"),
     ("1987-10-31", "Black Monday"),
+    ("1990-07-31", "S&L / 1990 recession"),
     ("2000-03-31", "Dot-com peak"),
     ("2008-09-30", "Lehman / GFC"),
     ("2011-08-31", "US debt downgrade"),
@@ -163,6 +175,23 @@ def _cached_pipeline(
         themes, res.labels, wf.end_dates,
         mode=label_mode, robust=robust, individual_z=z,
     )
+
+    # Bayesian regime probabilities (only meaningful for engines that
+    # produce centroids in feature space — primary, cosine, gmm).
+    regime_probs: np.ndarray | None = None
+    if method in ("primary", "cosine", "gmm") and res.cluster_centroids is not None:
+        Xs_imp, _, _, valid_mask = _standardize_with_impute(wf.features)
+        Xs_imp = Xs_imp[:, valid_mask]
+        nan_mask_imp = (~np.isnan(wf.features))[:, valid_mask]
+        try:
+            vi_full = _cov_inv(Xs_imp, robust=robust)
+            regime_probs = regime_probabilities(
+                Xs_imp, nan_mask_imp, res.cluster_centroids,
+                res.labels, vi_full, res.reference_idx,
+            )
+        except Exception:
+            regime_probs = None
+
     return {
         "panel": panel,
         "z": z,
@@ -171,12 +200,15 @@ def _cached_pipeline(
         "wf_end_dates": wf.end_dates,
         "wf_panel_slice": wf.panel_slice,
         "wf_window_size": wf.window_size,
+        "wf_columns": wf.columns,
+        "wf_column_active_mask": wf.column_active_mask,
         "sim_labels": res.labels,
         "sim_distances": res.distances,
         "sim_reference_idx": res.reference_idx,
         "sim_top_analogs": res.top_analogs,
         "sim_method": res.method,
         "regime_labels": [asdict(r) for r in rlabels],
+        "regime_probs": regime_probs,
     }
 
 
@@ -228,6 +260,189 @@ def _cached_walk_forward(
     )
 
 
+# ---------------------------------------------------------------------------
+# Hierarchical similarity, walk-forward labels, block-bootstrap null
+# ---------------------------------------------------------------------------
+
+
+def _hierarchical_distances(
+    z_for_features: pd.DataFrame,
+    window_size: int,
+    n_pca: int,
+    robust: bool,
+    horizons_periods: dict[str, int],
+) -> pd.DataFrame:
+    """Compute the today-vs-history Mahalanobis distance per timescale.
+
+    For each horizon (label → window length in periods), we rebuild the
+    feature matrix at that window and rank every history end-date by
+    distance from the most recent reference.  Returns a DataFrame indexed
+    by end-date with one column per horizon: ``dist_<label>`` and
+    ``rank_<label>``.
+    """
+    out_frames: list[pd.DataFrame] = []
+    for label, w in horizons_periods.items():
+        try:
+            wf_h = build_window_features(z_for_features, window_size=w, n_pca=n_pca, robust=robust)
+        except ValueError:
+            continue
+        Xs, _, _, valid = _standardize_with_impute(wf_h.features)
+        Xs = Xs[:, valid]
+        nan_mask = (~np.isnan(wf_h.features))[:, valid]
+        try:
+            vi = _cov_inv(Xs, robust=robust)
+        except Exception:
+            continue
+        ref = Xs[-1]
+        ref_active = nan_mask[-1]
+        d = _pairwise_mahalanobis(Xs, nan_mask, ref, ref_active, vi)
+        # Rank ignoring the reference itself + a small gap.
+        gap = max(w // 4, 6)
+        n = len(d)
+        rank = np.full(n, np.nan)
+        idx = np.arange(n)
+        finite = np.isfinite(d)
+        eligible = (np.abs(idx - (n - 1)) >= gap) & finite
+        order = np.argsort(np.where(eligible, d, np.inf))
+        for r, i in enumerate(order, start=1):
+            if not eligible[i]:
+                break
+            rank[i] = r
+        df = pd.DataFrame(
+            {f"dist_{label}": d, f"rank_{label}": rank},
+            index=wf_h.end_dates,
+        )
+        out_frames.append(df)
+    if not out_frames:
+        return pd.DataFrame()
+    out = out_frames[0]
+    for nxt in out_frames[1:]:
+        out = out.join(nxt, how="outer")
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _cached_hierarchical(
+    panel_key: str,
+    panel_bytes: bytes,
+    freq: str,
+    zmode: str,
+    rolling_years: int,
+    min_years: int,
+    feature_codes: tuple[str, ...],
+    robust: bool,
+    transforms_key: str,
+    horizons_key: str,  # comma-separated "label:periods" pairs
+):
+    panel = pd.read_parquet(io.BytesIO(panel_bytes))
+    panel.index = pd.to_datetime(panel.index)
+    transforms = dict(_decode_pairs(transforms_key))
+    horizons = {}
+    for token in horizons_key.split(","):
+        if ":" in token:
+            label, w = token.split(":", 1)
+            horizons[label] = int(w)
+    z = transform_and_zscore(
+        panel, transforms, freq=freq, mode=zmode,
+        rolling_years=rolling_years, min_years=min_years, robust=robust,
+    )
+    z_cols = [f"{c}_z" for c in feature_codes if f"{c}_z" in z.columns]
+    return _hierarchical_distances(z[z_cols], window_size=0, n_pca=3, robust=robust, horizons_periods=horizons)
+
+
+def _walk_forward_labels(
+    z_for_features: pd.DataFrame,
+    themes: pd.DataFrame,
+    individual_z: pd.DataFrame,
+    window_size: int,
+    n_clusters: int,
+    refit_every: int,
+    refit_lookback: int,
+    label_mode: str,
+    robust: bool,
+) -> pd.DataFrame:
+    """Refit clusters on a rolling window every `refit_every` periods.
+
+    For each rolling fit centered on date T, fit clusters on the most
+    recent `refit_lookback` window features ending at or before T; each
+    window in the next `refit_every`-period chunk is assigned to the
+    closest centroid under that local fit.
+
+    Returns: DataFrame indexed by end-date with columns
+    `cluster_local`, `label_local`.
+    """
+    wf = build_window_features(z_for_features, window_size=window_size, n_pca=3, robust=robust)
+    Xs, _, _, valid = _standardize_with_impute(wf.features)
+    Xs = Xs[:, valid]
+
+    n = len(wf.end_dates)
+    cluster_local = np.full(n, -1, dtype=int)
+    label_local = np.empty(n, dtype=object)
+    label_local[:] = ""
+
+    # Iterate forward; refit on the trailing `refit_lookback` features
+    # whenever we cross a refit boundary.
+    last_fit_end = -1
+    centroids: np.ndarray | None = None
+    member_labels: np.ndarray | None = None
+    fit_start_idx: int = 0
+    for i in range(n):
+        if (i - last_fit_end) >= refit_every or last_fit_end < 0:
+            start = max(0, i - refit_lookback + 1)
+            if i - start + 1 < max(2 * n_clusters, 24):
+                # not enough data to fit yet; defer
+                cluster_local[i] = -1
+                label_local[i] = ""
+                continue
+            sub = Xs[start : i + 1]
+            try:
+                model = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
+                sub_labels = model.fit_predict(sub)
+            except Exception:
+                cluster_local[i] = -1
+                continue
+            centroids = np.vstack(
+                [sub.mean(axis=0) if (sub_labels == c).sum() == 0
+                 else sub[sub_labels == c].mean(axis=0) for c in range(n_clusters)]
+            )
+            member_labels = sub_labels
+            fit_start_idx = start
+            last_fit_end = i
+            # Label centroids using cluster-mean theme z over the fit
+            # period so the regime tag is the contemporaneous one.
+            sub_end_dates = wf.end_dates[start : i + 1]
+            local_rlabels = label_clusters(
+                themes, sub_labels, sub_end_dates, mode=label_mode,
+                robust=robust, individual_z=individual_z,
+            )
+            local_lm = {rl.cluster: rl.label for rl in local_rlabels}
+            # Re-tag this index using closest centroid
+        if centroids is None:
+            continue
+        diffs = Xs[i] - centroids
+        # Plain Euclidean on the local fit space — local Mahalanobis is too
+        # expensive to recompute every period.
+        d2 = np.sum(diffs * diffs, axis=1)
+        c = int(np.argmin(d2))
+        cluster_local[i] = c
+        # Build label map from the most recent fit (memoize via local_lm).
+        # Recompute label_clusters when fit changes (it's already cached above).
+        # Here we rely on the most recent local_lm in scope — recompute once
+        # after each refit by re-evaluating (same as last_fit_end == i path).
+        sub_end_dates = wf.end_dates[fit_start_idx : last_fit_end + 1]
+        local_rlabels = label_clusters(
+            themes, member_labels, sub_end_dates, mode=label_mode,
+            robust=robust, individual_z=individual_z,
+        )
+        local_lm = {rl.cluster: rl.label for rl in local_rlabels}
+        label_local[i] = local_lm.get(c, f"#{c}")
+
+    return pd.DataFrame(
+        {"cluster_local": cluster_local, "label_local": label_local},
+        index=wf.end_dates,
+    )
+
+
 def _encode_pairs(d: dict[str, str]) -> str:
     return "|".join(f"{k}={v}" for k, v in sorted(d.items()))
 
@@ -246,15 +461,51 @@ def _decode_pairs(s: str) -> list[tuple[str, str]]:
 st.sidebar.title("Rhyme")
 st.sidebar.caption("History doesn't repeat, but it rhymes.")
 
-data_choice = st.sidebar.radio(
+DATA_SOURCE_OPTIONS = ["Public", "Private", "Custom"]
+data_choice = st.sidebar.selectbox(
     "Panel source",
-    ["Default (built-in)", "Upload CSV or JSON"],
-    horizontal=False,
+    DATA_SOURCE_OPTIONS,
+    index=0,
+    help=(
+        "Public: built-in FRED + Yahoo panel.  "
+        "Private: read tabula's long-format parquet (defaults to its "
+        "standard output path).  "
+        "Custom: upload a CSV or parquet (wide or long format)."
+    ),
 )
 
 uploaded = None
-if data_choice == "Upload CSV or JSON":
-    uploaded = st.sidebar.file_uploader("File (first column = date)", type=["csv", "json"])
+private_path: str | None = None
+TABULA_DEFAULT_PATH = "/Users/yili/Desktop/Claude/tabula/data/output/tabula_panel.parquet"
+if data_choice == "Private":
+    private_path = st.sidebar.text_input(
+        "Tabula parquet path",
+        value=TABULA_DEFAULT_PATH,
+        help="Long-format parquet: series_id, observation_date, value, source.",
+    )
+    private_upload = st.sidebar.file_uploader(
+        "...or upload a tabula parquet directly",
+        type=["parquet"],
+        key="private_upload",
+    )
+    if private_upload is not None:
+        uploaded = private_upload
+elif data_choice == "Custom":
+    uploaded = st.sidebar.file_uploader(
+        "File (CSV: first column = date; parquet: long-format with series_id/observation_date/value)",
+        type=["csv", "parquet", "json"],
+    )
+
+long_term_model = st.sidebar.checkbox(
+    "Long-term model (allow pre-2000 history)",
+    value=False,
+    help=(
+        "Off: panel observations before 2000-01-01 are filtered out — this "
+        "matches the public FRED+Yahoo coverage floor for most series.  "
+        "On: lets full GFD-sourced (or other) deep history through.  Useful "
+        "when you've loaded a private long panel that goes back to e.g. 1950."
+    ),
+)
 
 mode = st.sidebar.radio(
     "Mode",
@@ -320,24 +571,161 @@ method = st.sidebar.radio(
     index=0,
 )
 
+with st.sidebar.expander("Advanced (analog mechanics)", expanded=False):
+    walk_forward_labels_on = st.checkbox(
+        "Walk-forward regime labels",
+        value=False,
+        help=(
+            "Off: clusters are fit on the full panel up to today (one snapshot, "
+            "label space anchored to current data).  "
+            "On: clusters are refit every 12 periods on a rolling 360-period "
+            "(or full available) trailing window; each window's label is the "
+            "centroid it's closest to under the contemporaneous fit.  Slower "
+            "but reflects how the regime would have been classified at the time."
+        ),
+    )
+    hierarchical_on = st.checkbox(
+        "Hierarchical similarity (3y / 10y / 30y)",
+        value=False,
+        help=(
+            "Compute today-vs-history Mahalanobis distance separately for "
+            "short / medium / long lookback windows.  Surfaces in the Analogs "
+            "tab — today's regime can rhyme with different things on "
+            "different timescales."
+        ),
+    )
+    bootstrap_on = st.checkbox(
+        "Block-bootstrap significance (slow)",
+        value=False,
+        help=(
+            "Permute the panel in 24-month blocks 1000× and report the "
+            "distribution of best-analog distance under random data.  Flags "
+            "if today's best-analog distance is *not* in the tail of the "
+            "null — i.e. we'd see something this close even if the data were "
+            "random."
+        ),
+    )
+    comparison_on = st.checkbox(
+        "Comparison view (pick two dates)",
+        value=False,
+        help=(
+            "Pin two reference dates and overlay their themes / clocks / "
+            "cycle plots side-by-side."
+        ),
+    )
+
+compare_dates: tuple[pd.Timestamp, pd.Timestamp] | None = None
+if comparison_on:
+    with st.sidebar.expander("Comparison dates", expanded=True):
+        d1_str = st.text_input("Date A (YYYY-MM-DD)", value="2008-09-30")
+        d2_str = st.text_input("Date B (YYYY-MM-DD)", value="2022-06-30")
+        try:
+            compare_dates = (pd.Timestamp(d1_str), pd.Timestamp(d2_str))
+        except Exception:
+            compare_dates = None
+            st.sidebar.warning("Bad date — use YYYY-MM-DD.")
+
 # ---------------------------------------------------------------------------
 # Build panel
 # ---------------------------------------------------------------------------
 
 
+def _reshape_long_to_wide(long_df: pd.DataFrame) -> pd.DataFrame:
+    """Pivot a long-format panel (series_id / observation_date / value) into
+    rhyme's wide schema (date index, one column per series).
+
+    Tabula-style long format is detected by the presence of all three of
+    series_id, observation_date, value.  Other column names (case-
+    insensitive aliases) are also accepted: code/series, date, val.
+    """
+    cols = {c.lower(): c for c in long_df.columns}
+    date_col = (
+        cols.get("observation_date")
+        or cols.get("date")
+        or cols.get("obs_date")
+        or cols.get("period")
+    )
+    series_col = (
+        cols.get("series_id")
+        or cols.get("series")
+        or cols.get("code")
+        or cols.get("ticker")
+    )
+    value_col = cols.get("value") or cols.get("val") or cols.get("v")
+    if not (date_col and series_col and value_col):
+        raise ValueError(
+            "long-format requires columns for date, series_id, value (got "
+            f"{list(long_df.columns)})"
+        )
+    work = long_df[[date_col, series_col, value_col]].copy()
+    work[date_col] = pd.to_datetime(work[date_col])
+    work[value_col] = pd.to_numeric(work[value_col], errors="coerce")
+    wide = (
+        work.pivot_table(index=date_col, columns=series_col, values=value_col, aggfunc="last")
+        .sort_index()
+    )
+    wide.columns.name = None
+    return wide
+
+
 def _load_upload(file) -> tuple[pd.DataFrame, dict[str, str], dict[str, str]]:
+    """Read user-supplied panel from CSV / JSON / parquet.  Auto-detects
+    long-format parquet (tabula's schema) and pivots into wide."""
     name = getattr(file, "name", "").lower()
-    raw = pd.read_json(file) if name.endswith(".json") else pd.read_csv(file)
-    date_col = raw.columns[0]
-    raw[date_col] = pd.to_datetime(raw[date_col])
-    raw = raw.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
-    raw = raw.dropna(how="all")
-    transforms = infer_transforms(raw)
-    buckets = {c: "monetary" for c in raw.columns}
-    return raw, transforms, buckets
+    if name.endswith(".parquet"):
+        raw = pd.read_parquet(file)
+        if "value" in {c.lower() for c in raw.columns}:
+            wide = _reshape_long_to_wide(raw)
+        else:
+            # already wide; date is the index or the first column
+            if not isinstance(raw.index, pd.DatetimeIndex):
+                date_col = raw.columns[0]
+                raw[date_col] = pd.to_datetime(raw[date_col])
+                raw = raw.set_index(date_col)
+            wide = raw.sort_index().apply(pd.to_numeric, errors="coerce")
+    elif name.endswith(".json"):
+        raw = pd.read_json(file)
+        date_col = raw.columns[0]
+        raw[date_col] = pd.to_datetime(raw[date_col])
+        wide = raw.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
+    else:
+        raw = pd.read_csv(file)
+        if "value" in {c.lower() for c in raw.columns} and (
+            "series_id" in {c.lower() for c in raw.columns}
+            or "series" in {c.lower() for c in raw.columns}
+        ):
+            wide = _reshape_long_to_wide(raw)
+        else:
+            date_col = raw.columns[0]
+            raw[date_col] = pd.to_datetime(raw[date_col])
+            wide = raw.set_index(date_col).sort_index().apply(pd.to_numeric, errors="coerce")
+    wide = wide.dropna(how="all")
+    transforms = infer_transforms(wide)
+    buckets = {c: "monetary" for c in wide.columns}
+    return wide, transforms, buckets
 
 
-if data_choice == "Default (built-in)":
+def _load_private_path(path: str) -> tuple[pd.DataFrame, dict[str, str], dict[str, str]]:
+    """Read tabula-style long-format parquet from a filesystem path."""
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Private parquet not found: {path}")
+    raw = pd.read_parquet(p)
+    if "value" in {c.lower() for c in raw.columns}:
+        wide = _reshape_long_to_wide(raw)
+    else:
+        if not isinstance(raw.index, pd.DatetimeIndex):
+            date_col = raw.columns[0]
+            raw[date_col] = pd.to_datetime(raw[date_col])
+            raw = raw.set_index(date_col)
+        wide = raw.sort_index().apply(pd.to_numeric, errors="coerce")
+    wide = wide.dropna(how="all")
+    transforms = infer_transforms(wide)
+    buckets = {c: "monetary" for c in wide.columns}
+    return wide, transforms, buckets
+
+
+if data_choice == "Public":
     try:
         panel, meta = _cached_default_panel()
     except FileNotFoundError as e:
@@ -350,39 +738,39 @@ if data_choice == "Default (built-in)":
     feature_codes = [c for c in all_codes if DEFAULT_BUCKETS.get(c) in bucket_selection]
     transforms = DEFAULT_TRANSFORMS
     buckets = DEFAULT_BUCKETS
-    panel_source_name = "default"
-    # Drop series from the feature set (but keep in panel/themes) when they
-    # don't extend near the panel's current edge or don't cover enough history
-    # for a reasonable window. `dropna(how="any")` in feature building means
-    # a single stale/short series otherwise collapses the whole matrix.
-    _panel_end = pd.to_datetime(panel.index.max())
-    _stale_cutoff = _panel_end - pd.Timedelta(days=400)
-    _short_cutoff = _panel_end - pd.Timedelta(days=365 * 10)
-    _excluded = []
-    _kept = []
-    for c in feature_codes:
-        s = panel[c].dropna()
-        if s.empty or s.index.max() < _stale_cutoff or s.index.min() > _short_cutoff:
-            _excluded.append(c)
+    panel_source_name = "public"
+    # The old stale/short-series filter (a workaround for dropna(how="any")
+    # in build_window_features) is gone now that features are NaN-tolerant.
+    # A series with limited coverage simply contributes to whatever windows
+    # it overlaps with — see rhyme_lib/features.py for the active-mask
+    # design.  We still drop columns that have *no* data anywhere.
+    feature_codes = [c for c in feature_codes if panel[c].notna().any()]
+elif data_choice in ("Private", "Custom"):
+    src_label = data_choice.lower()
+    try:
+        if uploaded is not None:
+            panel, transforms, buckets = _load_upload(uploaded)
+            panel_source_name = getattr(uploaded, "name", f"{src_label}-upload")
+        elif data_choice == "Private" and private_path:
+            panel, transforms, buckets = _load_private_path(private_path)
+            panel_source_name = f"private:{Path(private_path).name}"
         else:
-            _kept.append(c)
-    if _excluded:
-        st.sidebar.caption(
-            f"Excluded from features (kept in themes): {', '.join(_excluded)}"
-        )
-    feature_codes = _kept
-else:
-    if uploaded is None:
-        st.info("Upload a CSV or JSON in the sidebar (first column = date, rest numeric).")
+            st.info(
+                "Choose a file or set the path in the sidebar.  "
+                "Private mode reads tabula's long-format parquet "
+                "(series_id / observation_date / value)."
+            )
+            st.stop()
+    except (FileNotFoundError, ValueError) as e:
+        st.error(f"Failed to load {src_label} panel: {e}")
         st.stop()
-    panel, transforms, buckets = _load_upload(uploaded)
     meta = pd.DataFrame(
         [
             {
                 "code": c,
                 "bucket": buckets[c],
                 "transform": transforms[c],
-                "source": "uploaded",
+                "source": src_label,
                 "n_obs": int(panel[c].notna().sum()),
                 "start": panel[c].dropna().index.min() if panel[c].notna().any() else None,
                 "end":   panel[c].dropna().index.max() if panel[c].notna().any() else None,
@@ -391,8 +779,23 @@ else:
         ]
     )
     all_codes = list(panel.columns)
-    feature_codes = list(panel.columns)
-    panel_source_name = getattr(uploaded, "name", "uploaded")
+    feature_codes = [c for c in panel.columns if panel[c].notna().any()]
+else:
+    st.error(f"Unknown panel source: {data_choice}")
+    st.stop()
+
+# Long-term-model toggle: enforce a 2000-01-01 floor when off so we mimic
+# the public-source coverage floor regardless of the underlying source.
+if not long_term_model:
+    floor = pd.Timestamp("2000-01-01")
+    if panel.index.min() < floor:
+        panel = panel.loc[panel.index >= floor]
+        if "start" in meta.columns:
+            meta = meta.assign(
+                start=meta["start"].apply(
+                    lambda d: max(pd.Timestamp(d), floor) if pd.notna(d) else d
+                )
+            )
 
 if not feature_codes:
     st.warning(f"No series in the {mode} buckets — check your panel bucket tags.")
@@ -440,6 +843,64 @@ fwd_by_horizon = {
 }
 
 # ---------------------------------------------------------------------------
+# Optional walk-forward labels + hierarchical timescale distances
+# ---------------------------------------------------------------------------
+
+walk_forward_label_df: pd.DataFrame | None = None
+if walk_forward_labels_on:
+    try:
+        # Use the same z-panel that fed the main feature build.
+        z_local = result["z"]
+        themes_local = result["themes"]
+        z_cols = [f"{c}_z" for c in feature_codes if f"{c}_z" in z_local.columns]
+        # Refit every 12 periods on a 360-period (or available) trailing window.
+        refit_every = 12
+        refit_lookback = 360
+        walk_forward_label_df = _walk_forward_labels(
+            z_for_features=z_local[z_cols],
+            themes=themes_local,
+            individual_z=z_local,
+            window_size=window_size,
+            n_clusters=n_clusters,
+            refit_every=refit_every,
+            refit_lookback=refit_lookback,
+            label_mode=("market" if mode == "Market" else "macro"),
+            robust=robust,
+        )
+    except Exception as e:
+        st.sidebar.warning(f"Walk-forward labels disabled: {e}")
+        walk_forward_label_df = None
+
+hierarchical_df: pd.DataFrame | None = None
+if hierarchical_on:
+    # Periods per horizon depend on freq.  Approximate: 1y = 12 (M) / 52 (W).
+    if freq == "M":
+        h_periods = {"3y": 36, "10y": 120, "30y": 360}
+    elif freq == "W":
+        h_periods = {"3y": 156, "10y": 520, "30y": 1560}
+    else:  # daily
+        h_periods = {"3y": 756, "10y": 2520, "30y": 7560}
+    horizons_key = ",".join(f"{k}:{v}" for k, v in h_periods.items())
+    try:
+        hierarchical_df = _cached_hierarchical(
+            panel_key=panel_source_name,
+            panel_bytes=_panel_bytes.getvalue(),
+            freq=freq,
+            zmode=zmode,
+            rolling_years=rolling_years,
+            min_years=min_years,
+            feature_codes=tuple(feature_codes),
+            robust=robust,
+            transforms_key=_encode_pairs(
+                {k: v for k, v in transforms.items() if k in all_codes}
+            ),
+            horizons_key=horizons_key,
+        )
+    except Exception as e:
+        st.sidebar.warning(f"Hierarchical similarity disabled: {e}")
+        hierarchical_df = None
+
+# ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
 
@@ -455,9 +916,43 @@ with tab_overview:
     st.caption("Historical analog / regime detection on US macro + market panels.")
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Reference window ends", ref_end.strftime("%Y-%m-%d"))
-    col2.metric("Today's regime", ref_label)
+    # If walk-forward labels are on, show the contemporaneous label.
+    if walk_forward_label_df is not None and ref_end in walk_forward_label_df.index:
+        wf_label = walk_forward_label_df.at[ref_end, "label_local"]
+        col2.metric("Today's regime (walk-forward)", wf_label or ref_label)
+    else:
+        col2.metric("Today's regime", ref_label)
     col3.metric("Windows analyzed", f"{len(result['wf_end_dates']):,}")
     col4.metric("Method", METHOD_LABELS[method].split(":", 1)[-1].strip())
+
+    # Bayesian regime probabilities — softmax over Mahalanobis distance to
+    # cluster centroids.
+    regime_probs = result.get("regime_probs")
+    if regime_probs is not None and len(regime_probs) == len(regime_labels):
+        st.subheader("Regime probabilities")
+        st.caption(
+            "Softmax over Mahalanobis distance to each cluster centroid: "
+            "p_k ∝ exp(-d_k² / τ).  τ = median within-cluster squared distance."
+        )
+        prob_df = pd.DataFrame({
+            "regime": [rl["label"] for rl in regime_labels],
+            "prob": regime_probs,
+        }).sort_values("prob", ascending=True)
+        fig_prob = go.Figure()
+        fig_prob.add_trace(go.Bar(
+            x=prob_df["prob"], y=prob_df["regime"], orientation="h",
+            marker=dict(color="#FFD700", line=dict(color="#D10000", width=1)),
+            text=[f"{p:.1%}" for p in prob_df["prob"]],
+            textposition="outside",
+        ))
+        fig_prob.update_layout(
+            height=max(220, 50 * len(prob_df) + 80),
+            xaxis=dict(title="probability", range=[0, 1.05], tickformat=".0%"),
+            yaxis_title=None,
+            showlegend=False,
+            margin=dict(l=10, r=10, t=10, b=30),
+        )
+        st.plotly_chart(fig_prob, use_container_width=True)
 
     st.subheader("Top 5 analogs")
     compact = top_analogs.head(5).copy()
@@ -468,8 +963,96 @@ with tab_overview:
     display["distance"] = display["distance"].apply(lambda v: f"{v:.3f}")
     st.dataframe(display, use_container_width=True, hide_index=True)
 
+    # --- Why this regime (top contributing z-scores) -----------------------
+    st.subheader("Why this regime")
+    st.caption(
+        "The series whose z-score at the reference window is most extreme — "
+        "directly falsifiable: if these readings change, the regime flag "
+        "should change."
+    )
+    z_today = result["z"].reindex(result["wf_end_dates"]).iloc[-1]
+    z_today = z_today.dropna()
+    if not z_today.empty:
+        z_sorted = z_today.sort_values()
+        top_neg = z_sorted.head(3)
+        top_pos = z_sorted.tail(3).iloc[::-1]
+        cwhy1, cwhy2 = st.columns(2)
+        with cwhy1:
+            st.markdown("**Most positive (overheated / above-trend)**")
+            why_pos = pd.DataFrame({
+                "series": [c[:-2] for c in top_pos.index],
+                "z": top_pos.values.round(2),
+            })
+            st.dataframe(why_pos, use_container_width=True, hide_index=True)
+        with cwhy2:
+            st.markdown("**Most negative (cooling / below-trend)**")
+            why_neg = pd.DataFrame({
+                "series": [c[:-2] for c in top_neg.index],
+                "z": top_neg.values.round(2),
+            })
+            st.dataframe(why_neg, use_container_width=True, hide_index=True)
+
     st.subheader("Theme z-scores (last 4 observations)")
     st.dataframe(result["themes"].dropna(how="all").tail(4).round(2), use_container_width=True)
+
+    # --- Block-bootstrap null distribution --------------------------------
+    if bootstrap_on:
+        st.subheader("Block-bootstrap significance test")
+        st.caption(
+            "Permute the panel in 24-month blocks 1000× and record the "
+            "best-analog Mahalanobis distance under each permutation.  "
+            "If today's best-analog distance is at the small-tail end of "
+            "this null, the analog is meaningfully better than chance; if "
+            "it's near the median, today doesn't rhyme with anything in "
+            "particular more than random data would."
+        )
+        try:
+            Xs_b, _, _, valid_b = _standardize_with_impute(result["wf_features"])
+            Xs_b = Xs_b[:, valid_b]
+            nan_mask_b = (~np.isnan(result["wf_features"]))[:, valid_b]
+            vi_b = _cov_inv(Xs_b, robust=robust)
+            block = 24 if freq == "M" else (24 * 4 if freq == "W" else 24 * 21)
+            null_dists = block_bootstrap_null_distance(
+                Xs_b, nan_mask_b, vi_b, ref_idx=ref_idx,
+                block_size=block, n_reps=1000, rng_seed=0,
+                min_gap=max(window_size // 4, 6),
+            )
+            null_dists = null_dists[np.isfinite(null_dists)]
+            actual = float(top_analogs["distance"].iloc[0])
+            pct = float((null_dists <= actual).mean()) if len(null_dists) else float("nan")
+
+            fig_null = go.Figure()
+            fig_null.add_trace(go.Histogram(
+                x=null_dists, nbinsx=40,
+                marker=dict(color="rgba(150,150,150,0.6)", line=dict(color="#888", width=1)),
+                name="null (block-bootstrap)",
+            ))
+            fig_null.add_vline(
+                x=actual, line_color="#D10000", line_width=2,
+                annotation_text=f"today's best = {actual:.3f}",
+                annotation_position="top",
+            )
+            fig_null.update_layout(
+                height=320,
+                xaxis_title="best-analog Mahalanobis distance",
+                yaxis_title="count under null",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_null, use_container_width=True)
+            verdict = (
+                "in the **small-tail** of the null — the best analog is meaningfully closer than random data"
+                if pct < 0.05
+                else "**not in the tail** — today doesn't rhyme more than random data would"
+                if pct > 0.5
+                else "in the lower-half of the null — modestly informative"
+            )
+            st.caption(
+                f"Today's best-analog distance is at the **{pct:.1%} percentile** "
+                f"of the 24-{('month' if freq == 'M' else 'period')} block-bootstrap null "
+                f"({len(null_dists)} reps).  Verdict: {verdict}."
+            )
+        except Exception as e:
+            st.warning(f"Bootstrap failed: {e}")
 
 # --- Data ------------------------------------------------------------------
 
@@ -715,6 +1298,32 @@ with tab_cycle:
             cycle_df, x_col, y_col, x_title, y_title,
             quad_labels, quad_colors, CYCLE_EVENTS, freq, note,
         )
+
+        # Comparison-view overlay: pin two dates with crimson + teal markers.
+        if compare_dates is not None:
+            for d, color, name in [
+                (compare_dates[0], "#D10000", f"A: {compare_dates[0].date()}"),
+                (compare_dates[1], "#0080A0", f"B: {compare_dates[1].date()}"),
+            ]:
+                if d not in cycle_df.index:
+                    pos_idx = cycle_df.index.get_indexer([d], method="nearest")
+                    if len(pos_idx) and pos_idx[0] >= 0:
+                        d_use = cycle_df.index[pos_idx[0]]
+                    else:
+                        continue
+                else:
+                    d_use = d
+                row = cycle_df.loc[d_use]
+                fig.add_trace(go.Scatter(
+                    x=[row[x_col]], y=[row[y_col]],
+                    mode="markers+text",
+                    marker=dict(size=18, color=color, symbol="circle-open",
+                                line=dict(color=color, width=3)),
+                    text=[f"  {name}"], textposition="middle right",
+                    textfont=dict(size=11, color=color),
+                    name=name, showlegend=False,
+                ))
+
         st.plotly_chart(fig, use_container_width=True)
 
         if not trail.empty:
@@ -725,6 +1334,29 @@ with tab_cycle:
                 f"Grey dots = every historical period. Diamonds = landmark events. "
                 f"Gold trail = T-12M → T-6M → T-3M → T-1M → today."
             )
+
+        # Comparison view: show themes side-by-side around each pinned date.
+        if compare_dates is not None:
+            st.markdown("---")
+            st.subheader("Comparison: themes & individual z at the pinned dates")
+            themes_df = result["themes"].dropna(how="all")
+            z_df = result["z"]
+            comp_rows = []
+            for d in compare_dates:
+                if d in themes_df.index:
+                    t_row = themes_df.loc[d]
+                else:
+                    pos = themes_df.index.get_indexer([d], method="nearest")
+                    if len(pos) and pos[0] >= 0:
+                        t_row = themes_df.iloc[pos[0]]
+                    else:
+                        continue
+                rec = {"date": pd.Timestamp(t_row.name).date()}
+                for col in themes_df.columns:
+                    rec[col] = round(float(t_row[col]), 2) if pd.notna(t_row[col]) else ""
+                comp_rows.append(rec)
+            if comp_rows:
+                st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
 
 # --- Regime map (2D embedding) ---------------------------------------------
 
@@ -916,6 +1548,40 @@ with tab_analogs:
         "`ust10_yield`, `baa_spread`, `aaa_spread` = forward changes in basis points. "
         "The **Avg** row averages the top K forward outcomes."
     )
+
+    # --- Hierarchical similarity table -------------------------------------
+    if hierarchical_df is not None and not hierarchical_df.empty:
+        st.subheader("Hierarchical similarity (3y / 10y / 30y)")
+        st.caption(
+            "Today's regime can rhyme with different histories on different "
+            "timescales.  Each column is a Mahalanobis distance computed on "
+            "features built from the labelled window length, plus today's "
+            "rank against history at that timescale."
+        )
+        # Build a reverse-distance ranked table — the K nearest end-dates at
+        # each horizon, joined on date.
+        h_labels = [c.replace("dist_", "") for c in hierarchical_df.columns if c.startswith("dist_")]
+        rows: list[dict] = []
+        for h in h_labels:
+            d_col = f"dist_{h}"
+            r_col = f"rank_{h}"
+            sub = hierarchical_df[[d_col, r_col]].dropna()
+            if sub.empty:
+                continue
+            top5 = sub.nsmallest(5, d_col).reset_index().rename(columns={"index": "end_date"})
+            for r in top5.itertuples():
+                rows.append({
+                    "horizon": h,
+                    "rank": int(getattr(r, r_col)),
+                    "end_date": getattr(r, "end_date").strftime("%Y-%m-%d"),
+                    "distance": f"{getattr(r, d_col):.3f}",
+                })
+        if rows:
+            st.dataframe(
+                pd.DataFrame(rows).sort_values(["horizon", "rank"]),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     st.subheader("Series overlay: reference window vs. top analogs")
     series_options = [c for c in result["z"].columns if c.endswith("_z")]

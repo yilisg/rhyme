@@ -74,12 +74,44 @@ Buckets:
 - **Sentiment (3):** UMCSENT, USEPUINDXD, CSCICP03USM665S *(OECD conf is
   ~1 year stale, auto-excluded from the feature matrix)*
 
-**Important: short / stale series filter.** `app.py` (~line 350) drops a
-series from the feature matrix if its last obs is > 400 days old or its
-first obs is < 10 years before panel end. This is necessary because
-`build_window_features` calls `dropna(how="any")` — a single stale series
-otherwise collapses the whole NaN-free intersection. Excluded series stay
-in theme aggregation so they still contribute to labels.
+**NaN-tolerant features (2026-04 rewrite).** `build_window_features` no
+longer calls `dropna(how="any")` and no longer requires the panel to be
+narrowed to a NaN-free intersection. For each window, every column with
+≥ `min_obs_in_window` non-NaN observations contributes its moments; a
+column inactive in that window simply yields NaN moment entries.
+Cross-series correlation pairs use the per-pair intersection. The
+similarity engines (Mahalanobis, cosine, GMM) standardize NaN-aware on
+the column-mean and impute at zero (≡ column mean in z-space) for
+clustering, but distance computations use the per-row active-mask to
+intersect features pair-by-pair. Windows with fewer than 5 active
+columns are dropped. Empirical impact on the default monthly Macro
+panel: NaN-free window count went from **42 → 562** (1979-07 → 2026-04)
+once the structural fix was in. The old "short / stale series filter"
+in `app.py` is gone; only columns with no data anywhere are excluded.
+Implemented in commit `7e00c3c` (NaN-Tolerant Window Features).
+
+## Source toggle
+
+Sidebar **Panel source** select (replaces the old "Default / Upload"
+radio). Three modes:
+
+- **Public** (default) — built-in FRED + Yahoo panel from `data/default_panel.parquet`.
+- **Private** — text input that defaults to
+  `/Users/yili/Desktop/Claude/tabula/data/output/tabula_panel.parquet`,
+  read directly via `pd.read_parquet`. Tabula's long-format schema
+  (`series_id`, `observation_date`, `value`, `source`) is auto-pivoted
+  to wide. Also accepts a parquet upload as an alternative to the path.
+  Per CLAUDE.md §1.7 / suite-wide convention, do NOT install tabula
+  via `pip install -e ../tabula`; consume its parquet output directly.
+- **Custom** — file uploader for CSV / parquet (long or wide) / JSON.
+
+## Long-term-model checkbox
+
+Sidebar checkbox, default **off**. When off, panel observations before
+**2000-01-01** are filtered out — this mimics the public-source coverage
+floor (most of the FRED+Yahoo series don't run cleanly that far back
+anyway). When on, full GFD-sourced or other deep history flows through.
+Useful with private long-history panels (1950+ in tabula's case).
 
 ## Macro vs Market mode
 
@@ -147,14 +179,16 @@ Modifier: VIX z > +0.7 → ` (high vol)`, < −0.7 → ` (calm)`.
 (accent, etc.) that want a point-in-time label without running the whole
 pipeline. Don't break that signature.
 
-**Known data limitation:** Macro mode currently shows mostly
-"Inflationary" / "Stagflation" labels because the feature-set NaN-free
-intersection only spans ~42 monthly windows ending 2022–2025, all
-genuinely inflation-dominated. Tightening the threshold from 0.30 → 0.15
-helped marginally. The right long-term fix is more pre-2010 inflation
-coverage with series that don't have NaN gaps; the short-term fix is the
-3-clock Cycle tab which lets the user see growth/inflation, vol/valuation,
-and sentiment/stress directly without depending on cluster labels.
+**Data coverage history.** Before the NaN-tolerant rewrite, Macro mode
+showed mostly "Inflationary" / "Stagflation" labels because the
+feature-set NaN-free intersection only spanned ~42 monthly windows
+ending 2022–2025, all genuinely inflation-dominated. The structural
+fix in commit `7e00c3c` grew the window count to ~562 monthly windows
+spanning 1979-07 → 2026-04, covering Volcker, the 1990 S&L recession,
+the dot-com bust, the GFC, and post-COVID inflation, so cluster labels
+now span the full grid. The 3-clock Cycle tab still lets the user
+inspect growth/inflation, vol/valuation, and sentiment/stress directly
+without depending on cluster labels.
 
 ## The Cycle tab (3 clocks)
 
@@ -217,24 +251,63 @@ codes = [s.code for s in DEFAULT_SPECS if s.bucket in {"growth", "inflation"}]
 z = transform_and_zscore(panel, DEFAULT_TRANSFORMS, freq="M",
                          rolling_years=20, min_years=10)
 themes = theme_aggregate(z, DEFAULT_BUCKETS)
-# Drop stale/short series (replicates the app.py filter)
-panel_end = panel.index.max()
-keep = [c for c in codes
-        if not panel[c].dropna().empty
-        and panel[c].dropna().index.max() >= panel_end - pd.Timedelta(days=400)
-        and panel[c].dropna().index.min() <= panel_end - pd.Timedelta(days=365*10)]
-zcols = [f"{c}_z" for c in keep if f"{c}_z" in z.columns]
-wf = build_window_features(z[zcols], window_size=60)
+# No more stale/short filter — features are NaN-tolerant.
+zcols = [f"{c}_z" for c in codes if f"{c}_z" in z.columns]
+wf = build_window_features(z[zcols], window_size=60)  # NaN-tolerant
 res = primary_similarity(wf, n_clusters=5)
 labels = label_clusters(themes, res.labels, wf.end_dates, mode="macro", individual_z=z)
+# Expect ~562 windows on the default monthly panel.
 ```
 
-If this raises `not enough NaN-free rows` something has changed in the
-panel — typically a new short-history series was added without a
-corresponding entry in the auto-exclude filter.
+If this raises `no windows had >= 5 active features` the panel has too
+few series with any coverage at the chosen window — try a shorter
+window or check that data was actually loaded.
+
+## Advanced toggles (sidebar expander)
+
+Four optional analysis modes, all default off:
+
+- **Walk-forward regime labels** — refits clusters every 12 periods on
+  a 360-period (or full available) trailing window; each window's
+  regime tag is the centroid it's closest to under the contemporaneous
+  fit. Avoids the "label space anchored to one snapshot" critique.
+- **Hierarchical similarity (3y / 10y / 30y)** — rebuilds the feature
+  matrix at each lookback window, ranks history-vs-today separately at
+  each timescale. Surfaces in the Analogs tab as a per-horizon top-5
+  table.
+- **Block-bootstrap significance** — permutes the panel in 24-period
+  blocks 1000× and records the best-analog Mahalanobis distance under
+  each permutation. Renders as a histogram with a crimson line at
+  today's actual best-analog distance and a percentile-based verdict.
+  Slow.
+- **Comparison view** — pin two reference dates (defaults
+  2008-09-30 / 2022-06-30); their markers overlay on the cycle clock
+  and a side-by-side themes table renders below.
+
+## Bayesian regime probabilities
+
+Overview tab now renders a softmax over Mahalanobis distance to each
+cluster centroid: `p_k ∝ exp(-d_k² / τ)` where τ defaults to the median
+within-cluster squared Mahalanobis distance. Falls back to the binary
+"today is regime X" metric when the engine doesn't expose centroids
+(currently only the secondary / SBD engine).
+
+## "Why this regime"
+
+Overview tab sub-section: the top 3 most positive and top 3 most
+negative individual z-scores at the reference window. Falsifiable —
+if these readings change, the regime flag should change.
 
 ## Recent change history (most recent first)
 
+- **0a67936** Bayesian probabilities, hierarchical similarity, walk-
+  forward labels, block-bootstrap (sidebar Advanced expander).
+- **c9769de** Source toggle (Public/Private/Custom), long-term-model
+  checkbox, expanded Cycle landmarks (S&L 1990, Volcker peak corrected).
+- **7e00c3c** NaN-tolerant `build_window_features` — drops the
+  `dropna(how="any")` constraint and per-pair intersects active
+  features in similarity engines. 42 → 562 windows on the default
+  monthly panel.
 - **89cbb55** Default to light theme (.streamlit/config.toml + darken
   Cycle landmark labels for readability).
 - **8b79fb3** Mode-specific regime labels (Market grid added), 3-clock
@@ -262,8 +335,11 @@ toggle, the bulk of the recent work).
 - **Always 3-decimal distances** in any UI surface.
 - **Themes computed over full panel; features computed only over the
   active mode's buckets.** Don't conflate the two scopes.
-- **`dropna(how="any")` in `build_window_features` is a hard constraint** —
-  always filter `feature_codes` for staleness/length before passing in.
+- **`build_window_features` is NaN-tolerant.** Don't try to dropna the
+  z-panel before feeding it in; columns with limited coverage are
+  expected and the active-mask design handles them. If you need a
+  hard floor on series coverage, use the long-term-model checkbox or
+  filter `feature_codes` to the universe you trust.
 - **Light theme everywhere** — match accent and compose. If you ever
   introduce dark-only colors (e.g. `rgba(220,220,220,...)` for text),
   audit that they read on white.

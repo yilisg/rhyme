@@ -121,6 +121,70 @@ to span a full cycle, short enough to adapt to regime shifts like the
 post-GFC low-rate environment. An **expanding** option is available for
 maximally long history at the cost of over-weighting the 1970s.
 
+### NaN-tolerant feature matrix
+
+`build_window_features` does **not** require an NaN-free intersection
+across series. For each window, every column with at least
+`max(window // 2, 6)` non-NaN observations contributes its moments;
+columns inactive in that window simply yield NaN moment entries.
+Cross-series correlation pairs use the per-pair valid intersection.
+The similarity engines (Mahalanobis, cosine, GMM) standardize NaN-aware
+on the column-mean and impute at zero (≡ column mean in z-space) for
+clustering, but distance computations restrict to the per-row active-
+mask intersection so a window with limited coverage isn't artificially
+close to anything. Windows with fewer than 5 active columns are
+dropped. This replaces the old `dropna(how="any")` collapse and
+expanded the default monthly Macro window count from ~42 to ~562.
+
+### Long-term-model toggle
+
+The sidebar **Long-term model** checkbox (default off) lets the user
+include panel observations before 2000-01-01. With the checkbox off,
+the panel is filtered to `>= 2000-01-01` regardless of source — this
+matches the practical coverage floor of the public FRED+Yahoo panel
+where most series start ~2000. With the checkbox on, deep-history
+sources (e.g. the tabula GFD-sourced parquet) flow through unmodified.
+
+## Optional advanced analyses
+
+### Bayesian regime probabilities
+
+The Overview tab renders a softmax over Mahalanobis distance to each
+cluster centroid: `p_k ∝ exp(-d_k² / τ)`. The temperature τ defaults to
+the median within-cluster squared Mahalanobis distance, so a window
+exactly at the typical within-cluster spread of cluster k is at probability
+mass `e^{-1}` relative to cluster k's central tendency. This replaces
+the binary "today is regime X" badge with a richer view of how
+ambiguous today's classification is.
+
+### Walk-forward regime labels (sidebar toggle)
+
+By default clusters are fit on the full panel up to today, anchoring
+the label space to one snapshot. With the toggle on, clusters are
+refit every 12 periods on a 360-period (or full-available) trailing
+window; each window's label is whichever centroid (under the
+contemporaneous fit) it's closest to. This costs an order of magnitude
+more compute but reflects how the regime would have been labeled at
+the time, not in 2026 hindsight.
+
+### Hierarchical similarity (3y / 10y / 30y)
+
+The same Mahalanobis distance, but recomputed at three different
+window lengths. Today's regime can rhyme with different histories on
+different timescales — a 3-year cyclical match might point at one
+era while a 30-year structural match points at another. Renders as a
+per-horizon top-5 table in the Analogs tab.
+
+### Block-bootstrap significance
+
+Permutes the panel in 24-period blocks 1000× and records the best-
+analog Mahalanobis distance under each permutation. The result is a
+null distribution for "best-analog distance under random data". If
+today's actual best-analog distance is in the small-tail of this null
+(say, <5th percentile), the analog is meaningfully closer than
+chance; if it's near the median, today doesn't rhyme with anything
+in particular more than random data would.
+
 ## Visualization choices
 
 - **Scatter (regime map):** UMAP is the default because it preserves global
